@@ -1,0 +1,180 @@
+###### I tried a funny name: single cell Breast cancer RNA Expression Software Tool (scBREAST) ################
+###### Wu et al. (PMID: 34493872) scRNAseq breast cancer atlas and annotations
+
+install.packages("BiocManager")        
+BiocManager::install("Seurat")          
+install.packages("ggplot2")
+install.packages("shiny")
+
+
+library(shiny)
+library(bslib)
+library(Seurat)
+library(ggplot2)
+
+#############
+# Global 
+#############
+seurat_obj <- readRDS("seurat_obj.rds")
+Idents(seurat_obj) <- "celltype_major"
+majors_all <- levels(Idents(seurat_obj))
+palMaj_all <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(length(majors_all))
+names(palMaj_all) <- majors_all
+
+#############
+# UI
+#############
+ui <- page_sidebar(
+  theme = bs_theme(
+    version = 5,
+    bootswatch = "minty",
+    base_font = font_google("Inter"),
+    heading_font = font_google("Roboto Slab")
+  ),
+  
+  title = "scBREAST – Interactive Viewer",
+  
+  sidebar = sidebar(
+    h5("Options", class = "text-primary fw-bold"),
+    selectInput("subtype", "Select tumor subtype:",
+                choices  = c("ER+", "HER2+", "TNBC"),
+                selected = "ER+"),
+    selectInput("gene", "Select a gene:",
+                choices  = rownames(seurat_obj),
+                selected = "TGFBI"),
+    radioButtons("view", "Plot type:",
+                 choices  = c("FeaturePlot" = "feature", "Jitter" = "jitter"),
+                 selected = "feature"),
+    hr(),
+    selectInput("chosenMajor", "Subset by Major cell type:",
+                choices = majors_all,
+                selected = NULL),
+    hr(),
+    tags$p("Julian Primig", class = "text-muted small")
+  ),
+  
+  fill = TRUE,
+  layout = "sidebar",
+  
+  # Corps principal avec scroll
+  div(
+    style = "max-height: 85vh; overflow-y: auto; padding-right: 10px;",
+    
+    tabsetPanel(
+      tabPanel("Global UMAP",
+               plotOutput("refUMAP", height="500px")),
+      
+      tabPanel("Expression",
+               conditionalPanel("input.view=='feature'",
+                                plotOutput("featurePlot", height="500px")),
+               conditionalPanel("input.view=='jitter'",
+                                plotOutput("jitterPlot",  height="500px"))),
+      
+      tabPanel("Minor clusters",
+               h4(textOutput("titleMinor"), class="fw-bold text-primary"),
+               plotOutput("minorUMAP",        height="500px"),
+               plotOutput("minorFeaturePlot", height="500px"))
+    )
+  )
+)
+
+#############
+# Server
+#############
+server <- function(input, output, session) {
+  baseObj <- reactive({
+    withProgress(message = "Clustering global microenvironment…", value = 0, {
+      sub <- subset(seurat_obj, subset = subtype == input$subtype); incProgress(0.2)
+      sub <- NormalizeData(sub);           incProgress(0.2)
+      sub <- FindVariableFeatures(sub, selection.method = "vst", nfeatures = 2000); incProgress(0.2)
+      sub <- ScaleData(sub, features = VariableFeatures(sub)); incProgress(0.2)
+      sub <- RunPCA(sub, features = VariableFeatures(sub)); incProgress(0.1)
+      sub <- FindNeighbors(sub, dims = 1:10)
+      sub <- FindClusters(sub, resolution = 0.5)
+      sub <- RunUMAP(sub, dims = 1:10)
+      Idents(sub) <- "celltype_major";     incProgress(0.1)
+      sub
+    })
+  })
+  
+  output$refUMAP <- renderPlot({
+    obj    <- baseObj()
+    majors <- levels(Idents(obj))
+    pal    <- palMaj_all[majors]
+    DimPlot(obj, reduction="umap", cols=pal, pt.size=0.5, label=FALSE) +
+      ggtitle(paste(input$subtype, "microenvironment (reclustered)")) +
+      theme_minimal() +
+      theme(legend.position="right",
+            plot.title = element_text(hjust=0.5))
+  })
+  
+  dataGene <- reactive({
+    FetchData(baseObj(), vars = c(input$gene, "celltype_major"))
+  })
+  
+  output$jitterPlot <- renderPlot({
+    df <- dataGene()
+    ggplot(df, aes(x=celltype_major, y=.data[[input$gene]], color=celltype_major)) +
+      geom_jitter(width=0.2, size=0.5, alpha=0.7) +
+      theme_minimal() +
+      theme(legend.position="none",
+            axis.text.x = element_text(angle=45, hjust=1)) +
+      labs(title=paste(input$gene, "in", input$subtype, "microenvironment"), x=NULL)
+  })
+  
+  output$featurePlot <- renderPlot({
+    FeaturePlot(baseObj(),
+                features=input$gene,
+                reduction="umap",
+                cols=c("lightgrey","darkred"),
+                pt.size=0.5,
+                order=TRUE) +
+      ggtitle(paste("FeaturePlot –", input$gene)) +
+      theme_minimal() +
+      theme(plot.title=element_text(hjust=0.5),
+            legend.position="right")
+  })
+  
+  recluster <- reactive({
+    req(input$chosenMajor)
+    withProgress(message=paste("Clustering", input$chosenMajor, "…"), value=0, {
+      sub <- subset(baseObj(), idents=input$chosenMajor); incProgress(0.3)
+      sub <- NormalizeData(sub);           incProgress(0.2)
+      sub <- ScaleData(sub);               incProgress(0.2)
+      sub <- RunPCA(sub, features=rownames(sub)); incProgress(0.15)
+      sub <- FindNeighbors(sub, dims=1:10)
+      sub <- FindClusters(sub, resolution=0.5)
+      sub <- RunUMAP(sub, dims=1:10);       incProgress(0.15)
+      sub
+    })
+  })
+  
+  output$titleMinor <- renderText({
+    req(input$chosenMajor)
+    paste(input$chosenMajor, "- reclustered & annotated by minor cell types")
+  })
+  
+  output$minorUMAP <- renderPlot({
+    sub <- recluster()
+    DimPlot(sub, reduction="umap", group.by="celltype_minor", pt.size=0.5) +
+      ggtitle("Minor clusters UMAP") +
+      theme_minimal() +
+      theme(legend.position="right", plot.title=element_text(hjust=0.5))
+  })
+  
+  output$minorFeaturePlot <- renderPlot({
+    sub <- recluster()
+    FeaturePlot(sub,
+                features=input$gene,
+                reduction="umap",
+                cols=c("lightgrey","darkred"),
+                pt.size=0.5,
+                order=TRUE) +
+      ggtitle(paste(input$gene, "in", input$chosenMajor, "subset")) +
+      theme_minimal() +
+      theme(legend.position="right", plot.title=element_text(hjust=0.5))
+  })
+}
+
+shinyApp(ui, server)
+
