@@ -1,16 +1,14 @@
 ###### I tried a funny name: single cell Breast cancer RNA Expression Software Tool (scBREAST) ################
 ###### Wu et al. (PMID: 34493872) scRNAseq breast cancer atlas and annotations
 
-install.packages("BiocManager")        
-BiocManager::install("Seurat")          
-install.packages("ggplot2")
-install.packages("shiny")
 
 
 library(shiny)
 library(bslib)
 library(Seurat)
 library(ggplot2)
+library(RColorBrewer)
+library(Matrix)
 
 #############
 # Global 
@@ -18,7 +16,7 @@ library(ggplot2)
 seurat_obj <- readRDS("seurat_obj.rds")
 Idents(seurat_obj) <- "celltype_major"
 majors_all <- levels(Idents(seurat_obj))
-palMaj_all <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(length(majors_all))
+palMaj_all <- colorRampPalette(brewer.pal(12, "Set3"))(length(majors_all))
 names(palMaj_all) <- majors_all
 
 #############
@@ -50,6 +48,11 @@ ui <- page_sidebar(
                 choices = majors_all,
                 selected = NULL),
     hr(),
+    # ---- Options d'export PDF ----
+    h6("Export PDF options", class = "text-primary fw-bold"),
+    textInput("filebase", "File name (without extension):", "scBREAST_plot"),
+    numericInput("w_in", "Width (inches):", 6, min = 2, max = 20, step = 0.5),
+    numericInput("h_in", "Height (inches):", 5, min = 2, max = 20, step = 0.5),
     tags$p("Julian Primig", class = "text-muted small")
   ),
   
@@ -62,17 +65,37 @@ ui <- page_sidebar(
     
     tabsetPanel(
       tabPanel("Global UMAP",
+               div(class = "d-flex justify-content-between align-items-center",
+                   tags$div(),
+                   downloadButton("dl_refUMAP", "Download PDF", class = "btn-sm")
+               ),
                plotOutput("refUMAP", height="500px")),
       
       tabPanel("Expression",
                conditionalPanel("input.view=='feature'",
+                                div(class = "d-flex justify-content-between align-items-center",
+                                    tags$div(),
+                                    downloadButton("dl_feature", "Download PDF", class = "btn-sm")
+                                ),
                                 plotOutput("featurePlot", height="500px")),
                conditionalPanel("input.view=='jitter'",
+                                div(class = "d-flex justify-content-between align-items-center",
+                                    tags$div(),
+                                    downloadButton("dl_jitter", "Download PDF", class = "btn-sm")
+                                ),
                                 plotOutput("jitterPlot",  height="500px"))),
       
       tabPanel("Minor clusters",
                h4(textOutput("titleMinor"), class="fw-bold text-primary"),
+               div(class = "d-flex justify-content-between align-items-center",
+                   tags$div(),
+                   downloadButton("dl_minorUMAP", "Download PDF", class = "btn-sm")
+               ),
                plotOutput("minorUMAP",        height="500px"),
+               div(class = "d-flex justify-content-between align-items-center",
+                   tags$div(),
+                   downloadButton("dl_minorFeature", "Download PDF", class = "btn-sm")
+               ),
                plotOutput("minorFeaturePlot", height="500px"))
     )
   )
@@ -82,6 +105,7 @@ ui <- page_sidebar(
 # Server
 #############
 server <- function(input, output, session) {
+  # ---------- Data prep ----------
   baseObj <- reactive({
     withProgress(message = "Clustering global microenvironment…", value = 0, {
       sub <- subset(seurat_obj, subset = subtype == input$subtype); incProgress(0.2)
@@ -97,42 +121,8 @@ server <- function(input, output, session) {
     })
   })
   
-  output$refUMAP <- renderPlot({
-    obj    <- baseObj()
-    majors <- levels(Idents(obj))
-    pal    <- palMaj_all[majors]
-    DimPlot(obj, reduction="umap", cols=pal, pt.size=0.5, label=FALSE) +
-      ggtitle(paste(input$subtype, "microenvironment (reclustered)")) +
-      theme_minimal() +
-      theme(legend.position="right",
-            plot.title = element_text(hjust=0.5))
-  })
-  
   dataGene <- reactive({
     FetchData(baseObj(), vars = c(input$gene, "celltype_major"))
-  })
-  
-  output$jitterPlot <- renderPlot({
-    df <- dataGene()
-    ggplot(df, aes(x=celltype_major, y=.data[[input$gene]], color=celltype_major)) +
-      geom_jitter(width=0.2, size=0.5, alpha=0.7) +
-      theme_minimal() +
-      theme(legend.position="none",
-            axis.text.x = element_text(angle=45, hjust=1)) +
-      labs(title=paste(input$gene, "in", input$subtype, "microenvironment"), x=NULL)
-  })
-  
-  output$featurePlot <- renderPlot({
-    FeaturePlot(baseObj(),
-                features=input$gene,
-                reduction="umap",
-                cols=c("lightgrey","darkred"),
-                pt.size=0.5,
-                order=TRUE) +
-      ggtitle(paste("FeaturePlot –", input$gene)) +
-      theme_minimal() +
-      theme(plot.title=element_text(hjust=0.5),
-            legend.position="right")
   })
   
   recluster <- reactive({
@@ -154,7 +144,42 @@ server <- function(input, output, session) {
     paste(input$chosenMajor, "- reclustered & annotated by minor cell types")
   })
   
-  output$minorUMAP <- renderPlot({
+  # ---------- Plot builders (réutilisés pour renderPlot & export) ----------
+  plot_refUMAP <- reactive({
+    obj    <- baseObj()
+    majors <- levels(Idents(obj))
+    pal    <- palMaj_all[majors]
+    DimPlot(obj, reduction="umap", cols=pal, pt.size=0.5, label=FALSE) +
+      ggtitle(paste(input$subtype, "microenvironment (reclustered)")) +
+      theme_minimal() +
+      theme(legend.position="right",
+            plot.title = element_text(hjust=0.5))
+  })
+  
+  plot_jitter <- reactive({
+    df <- dataGene()
+    ggplot(df, aes(x=celltype_major, y=.data[[input$gene]], color=celltype_major)) +
+      geom_jitter(width=0.2, size=0.5, alpha=0.7) +
+      theme_minimal() +
+      theme(legend.position="none",
+            axis.text.x = element_text(angle=45, hjust=1)) +
+      labs(title=paste(input$gene, "in", input$subtype, "microenvironment"), x=NULL, y=input$gene)
+  })
+  
+  plot_feature <- reactive({
+    FeaturePlot(baseObj(),
+                features=input$gene,
+                reduction="umap",
+                cols=c("lightgrey","darkred"),
+                pt.size=0.5,
+                order=TRUE) +
+      ggtitle(paste("FeaturePlot –", input$gene)) +
+      theme_minimal() +
+      theme(plot.title=element_text(hjust=0.5),
+            legend.position="right")
+  })
+  
+  plot_minorUMAP <- reactive({
     sub <- recluster()
     DimPlot(sub, reduction="umap", group.by="celltype_minor", pt.size=0.5) +
       ggtitle("Minor clusters UMAP") +
@@ -162,7 +187,7 @@ server <- function(input, output, session) {
       theme(legend.position="right", plot.title=element_text(hjust=0.5))
   })
   
-  output$minorFeaturePlot <- renderPlot({
+  plot_minorFeature <- reactive({
     sub <- recluster()
     FeaturePlot(sub,
                 features=input$gene,
@@ -174,7 +199,47 @@ server <- function(input, output, session) {
       theme_minimal() +
       theme(legend.position="right", plot.title=element_text(hjust=0.5))
   })
+  
+  # ---------- Renders ----------
+  output$refUMAP         <- renderPlot({ plot_refUMAP() })
+  output$jitterPlot      <- renderPlot({ plot_jitter() })
+  output$featurePlot     <- renderPlot({ plot_feature() })
+  output$minorUMAP       <- renderPlot({ plot_minorUMAP() })
+  output$minorFeaturePlot<- renderPlot({ plot_minorFeature() })
+  
+  # ---------- Download handlers (PDF vectoriel) ----------
+  save_pdf <- function(plot_obj, file){
+    ggplot2::ggsave(
+      filename = file,
+      plot     = plot_obj,
+      device   = cairo_pdf,   # PDF vectoriel, transparences OK
+      width    = input$w_in,
+      height   = input$h_in,
+      units    = "in",
+      limitsize = FALSE
+    )
+  }
+  
+  output$dl_refUMAP <- downloadHandler(
+    filename = function() sprintf("%s__GlobalUMAP.pdf", input$filebase),
+    content  = function(file) save_pdf(plot_refUMAP(), file)
+  )
+  output$dl_jitter <- downloadHandler(
+    filename = function() sprintf("%s__Jitter_%s.pdf", input$filebase, input$gene),
+    content  = function(file) save_pdf(plot_jitter(), file)
+  )
+  output$dl_feature <- downloadHandler(
+    filename = function() sprintf("%s__Feature_%s.pdf", input$filebase, input$gene),
+    content  = function(file) save_pdf(plot_feature(), file)
+  )
+  output$dl_minorUMAP <- downloadHandler(
+    filename = function() sprintf("%s__MinorUMAP_%s.pdf", input$filebase, input$chosenMajor %||% "NA"),
+    content  = function(file) save_pdf(plot_minorUMAP(), file)
+  )
+  output$dl_minorFeature <- downloadHandler(
+    filename = function() sprintf("%s__MinorFeature_%s_%s.pdf", input$filebase, input$chosenMajor %||% "NA", input$gene),
+    content  = function(file) save_pdf(plot_minorFeature(), file)
+  )
 }
 
 shinyApp(ui, server)
-
