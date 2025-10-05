@@ -3,6 +3,14 @@
 
 
 
+install.packages("BiocManager")        
+BiocManager::install("Seurat")          
+install.packages("ggplot2")
+install.packages("shiny")
+install.packages("bslib")
+install.packages("RColorBrewer")
+install.packages("Matrix")
+
 library(shiny)
 library(bslib)
 library(Seurat)
@@ -243,3 +251,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
