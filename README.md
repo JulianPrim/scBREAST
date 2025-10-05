@@ -1,4 +1,4 @@
-# scBREAST single cell Breast cancer expression analysis software
+# scBREAST ## single cell Breast cancer expression analysis software
 viewer of Wu et al. single cell atlas of breast tumors (PMID: 34493872)
 
 Download the release "seurat_obj.rds", put it in a folder. In R, set up your working directory in that folder. Copy-Paste the script and press runApp.
