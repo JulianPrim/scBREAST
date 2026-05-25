@@ -1,37 +1,36 @@
-###############################################################
-#        Breast Cancer Toolkit: BREAST + T-47D ChIP Viewer    #
-###############################################################
-
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
   library(Seurat)
   library(ggplot2)
   library(RColorBrewer)
-  library(Matrix)
-  library(grid)         
-  library(plotly)
   library(dplyr)
-  library(readr)
   library(tibble)
+  library(readr)
+  library(DT)
+  library(grid)
+  library(plotly)
   library(htmlwidgets)
   library(EnsDb.Hsapiens.v86)
   library(AnnotationFilter)
   library(GenomicRanges)
   library(IRanges)
+  library(GenomeInfoDb)
   library(rtracklayer)
-  library(stringr)
-  library(tidyr)
-  library(DT)
 })
 
-options(future.globals.maxSize = 4 * 1024^3)  # 4 GB
+options(future.globals.maxSize = 4 * 1024^3)
 
+`%||%` <- function(x, y) {
+  if (!is.null(x) && length(x) > 0 && !is.na(x)) x else y
+}
 
-`%||%` <- function(x, y) if (!is.null(x) && length(x) > 0 && !is.na(x)) x else y
+# ============================================================
+# Theme and helpers
+# ============================================================
 
-# ---------------- Shared Theme & Helpers ----------------
 PASTEL <- "#94d2bd"
+
 app_theme <- bs_theme(
   version = 5,
   bootswatch = "minty",
@@ -40,18 +39,279 @@ app_theme <- bs_theme(
   heading_font = font_collection("Helvetica Neue", "Arial", "sans-serif")
 )
 
-safe_palette <- function(n){
-  if (n <= 0) character(0) else if (n <= 8) {
-    RColorBrewer::brewer.pal(max(n, 3), "Dark2")[seq_len(n)]
-  } else colorRampPalette(RColorBrewer::brewer.pal(8, "Dark2"))(n)
+# Nature / NPG-like palette
+paper_like_palette <- c(
+  "#E64B35FF", "#4DBBD5FF", "#00A087FF", "#3C5488FF", "#F39B7FFF",
+  "#8491B4FF", "#91D1C2FF", "#DC0000FF", "#7E6148FF", "#B09C85FF",
+  "#A73030FF", "#6A6599FF", "#5F9EA0FF", "#B87333FF", "#8FBC8FFF",
+  "#BC8F8FFF", "#4682B4FF", "#D2691EFF", "#9ACD32FF", "#C71585FF",
+  "#20B2AAFF", "#FF8C00FF", "#9370DBFF", "#2E8B57FF", "#CD5C5CFF"
+)
+
+priority_colors <- c(
+  "Cancer Epithelial" = "#E64B35FF",
+  "Normal Epithelial" = "#6A6599FF",
+  "T-cells" = "#A73030FF",
+  "Myeloid" = "#F39B7FFF",
+  "CAFs" = "#B87333FF",
+  "Endothelial" = "#8491B4FF",
+  "B-cells" = "#9ACD32FF",
+  "Plasmablasts" = "#8FBC8FFF",
+  "PVL" = "#7E6148FF",
+  "Cancer Basal SC" = "#A73030FF",
+  "Cancer Cycling" = "#E64B35FF",
+  "Cancer Her2 SC" = "#2E8B57FF",
+  "Cancer LumA SC" = "#8FBC8FFF",
+  "Cancer LumB SC" = "#4682B4FF",
+  "Mature Luminal" = "#4DBBD5FF",
+  "Luminal Progenitors" = "#91D1C2FF",
+  "Myoepithelial" = "#8491B4FF"
+)
+
+order_groups_priority <- function(groups) {
+  groups <- unique(as.character(groups))
+  groups <- groups[!is.na(groups)]
+  
+  priority <- c(
+    "Cancer Epithelial",
+    "Normal Epithelial",
+    "Cancer Basal SC",
+    "Cancer Cycling",
+    "Cancer Her2 SC",
+    "Cancer LumA SC",
+    "Cancer LumB SC",
+    "Mature Luminal",
+    "Luminal Progenitors",
+    "Myoepithelial"
+  )
+  
+  c(
+    intersect(priority, groups),
+    sort(setdiff(groups, priority))
+  )
 }
 
-# ---------------- Constants (ChIP viewer) ----------------
-CFILE_T47D   <- "T47D_formatted_50.bed"
+make_palette <- function(groups) {
+  groups <- order_groups_priority(groups)
+  
+  if (length(groups) == 0) {
+    return(character(0))
+  }
+  
+  pal <- character(length(groups))
+  names(pal) <- groups
+  
+  known <- intersect(groups, names(priority_colors))
+  pal[known] <- priority_colors[known]
+  
+  remaining <- setdiff(groups, known)
+  if (length(remaining) > 0) {
+    extra_pal <- paper_like_palette
+    extra_pal <- extra_pal[!extra_pal %in% pal[known]]
+    
+    if (length(remaining) <= length(extra_pal)) {
+      pal[remaining] <- extra_pal[seq_along(remaining)]
+    } else {
+      pal[remaining] <- colorRampPalette(extra_pal)(length(remaining))
+    }
+  }
+  
+  pal
+}
+
+safe_palette <- function(n) {
+  if (n <= 0) {
+    character(0)
+  } else if (n <= length(paper_like_palette)) {
+    paper_like_palette[seq_len(n)]
+  } else {
+    colorRampPalette(paper_like_palette)(n)
+  }
+}
+
+theme_umap <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+      panel.grid.minor = element_line(color = "grey95", linewidth = 0.15),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 2),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey35", size = base_size),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(color = "grey20"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+theme_paper <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+      panel.grid.minor = element_line(color = "grey95", linewidth = 0.15),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 2),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey35", size = base_size),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "grey20"),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(color = "grey20"),
+      strip.background = element_rect(fill = "grey92", color = NA),
+      strip.text = element_text(face = "bold", color = "grey20"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+sanitize_name <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_+|_+$", "", x)
+  x <- gsub("_+", "_", x)
+  x
+}
+
+make_local_reduction_name <- function(subtype, major) {
+  paste0(
+    "umap_local__",
+    sanitize_name(subtype),
+    "__",
+    sanitize_name(major)
+  )
+}
+
+save_pdf <- function(plot_obj, file, w, h) {
+  dev_fun <- if (isTRUE(capabilities("cairo"))) cairo_pdf else "pdf"
+  
+  ggplot2::ggsave(
+    filename = file,
+    plot = plot_obj,
+    device = dev_fun,
+    width = w,
+    height = h,
+    units = "in",
+    limitsize = FALSE
+  )
+}
+
+make_manual_feature_plot <- function(
+    obj,
+    reduction,
+    gene,
+    pt_size = 0.45,
+    base_size = 11,
+    coord_ratio = 1,
+    title = NULL,
+    min_expr = 0,
+    max_quantile = 0.99
+) {
+  validate(
+    need(reduction %in% Reductions(obj), paste0("Reduction not found: ", reduction)),
+    need(gene %in% rownames(obj), paste0("Gene not found: ", gene))
+  )
+  
+  emb <- Embeddings(obj, reduction)
+  
+  validate(
+    need(ncol(emb) >= 2, paste0("Reduction ", reduction, " has fewer than 2 dimensions."))
+  )
+  
+  emb <- emb[, 1:2, drop = FALSE]
+  
+  expr_df <- FetchData(
+    obj,
+    vars = gene,
+    cells = rownames(emb)
+  )
+  
+  df <- data.frame(
+    cell = rownames(emb),
+    umap_1 = emb[, 1],
+    umap_2 = emb[, 2],
+    expr = expr_df[rownames(emb), gene],
+    stringsAsFactors = FALSE
+  )
+  
+  df$expr[is.na(df$expr)] <- 0
+  df$positive <- df$expr > min_expr
+  
+  n_pos <- sum(df$positive, na.rm = TRUE)
+  
+  if (n_pos > 0) {
+    max_cut <- suppressWarnings(
+      quantile(df$expr[df$positive], probs = max_quantile, na.rm = TRUE)
+    )
+    
+    if (!is.finite(max_cut) || max_cut <= min_expr) {
+      max_cut <- max(df$expr, na.rm = TRUE)
+    }
+    
+    if (!is.finite(max_cut) || max_cut <= min_expr) {
+      max_cut <- min_expr + 1
+    }
+    
+    df$expr_plot <- pmin(df$expr, max_cut)
+  } else {
+    max_cut <- min_expr + 1
+    df$expr_plot <- df$expr
+  }
+  
+  df_bg <- df[!df$positive, , drop = FALSE]
+  df_pos <- df[df$positive, , drop = FALSE]
+  df_pos <- df_pos[order(df_pos$expr_plot), , drop = FALSE]
+  
+  if (is.null(title)) {
+    title <- paste0(gene, " expression")
+  }
+  
+  ggplot() +
+    geom_point(
+      data = df_bg,
+      aes(x = umap_1, y = umap_2),
+      color = "#eeeeee",
+      size = pt_size,
+      alpha = 0.75
+    ) +
+    geom_point(
+      data = df_pos,
+      aes(x = umap_1, y = umap_2, color = expr_plot),
+      size = pt_size,
+      alpha = 0.95
+    ) +
+    scale_color_gradientn(
+      colors = c("#FAD7C7", "#E76F51", "#B2182B"),
+      limits = c(min_expr, max_cut),
+      oob = scales::squish,
+      name = gene
+    ) +
+    labs(
+      title = title,
+      subtitle = paste0(n_pos, " positive cells"),
+      x = NULL,
+      y = NULL
+    ) +
+    theme_umap(base_size) +
+    theme(
+      legend.position = "right",
+      plot.subtitle = element_text(hjust = 0.5, color = "grey35")
+    ) +
+    coord_fixed(ratio = coord_ratio)
+}
+
+# ============================================================
+# ChIP viewer constants
+# ============================================================
+
+CFILE_T47D <- "T47D_formatted_50.bed"
 SRX_URL_BASE <- "https://chip-atlas.org/view?id="
 
-ccre_classes <- c("PLS","pELS","dELS","CTCF-only","DNase-H3K4me3")
-ccre_cols    <- c(
+ccre_classes <- c("PLS", "pELS", "dELS", "CTCF-only", "DNase-H3K4me3")
+
+ccre_cols <- c(
   PLS = "red",
   pELS = "orange",
   dELS = "yellow",
@@ -59,56 +319,234 @@ ccre_cols    <- c(
   `DNase-H3K4me3` = "pink"
 )
 
-# Load cCREs once (if present)
 ccres <- NULL
+
 if (file.exists("ENCFF389ZVZ_cCREs.bigBed")) {
   ccres <- try({
     x <- import("ENCFF389ZVZ_cCREs.bigBed", format = "bigBed")
-    x$creClass        <- sub(",.*", "", x$ccre)
-    seqlevelsStyle(x) <- "UCSC"; genome(x) <- "hg38"; seqlengths(x) <- NA
+    x$creClass <- sub(",.*", "", x$ccre)
+    seqlevelsStyle(x) <- "UCSC"
+    genome(x) <- "hg38"
+    seqlengths(x) <- NA
     x
   }, silent = TRUE)
-  if (inherits(ccres, "try-error")) ccres <- NULL
+  
+  if (inherits(ccres, "try-error")) {
+    ccres <- NULL
+  }
 }
 
-# ---------------- Data (scBREAST) ----------------
-stopifnot(file.exists("seurat_obj.rds"))
-seurat_obj <- readRDS("seurat_obj.rds")
+# ============================================================
+# Load Seurat object
+# ============================================================
 
-# Adapte ceci si tes colonnes meta ont d'autres noms
-stopifnot(all(c("celltype_major","subtype") %in% colnames(seurat_obj@meta.data)))
+input_rds <- "seurat_obj_v2.rds"
+
+if (!file.exists(input_rds)) {
+  stop("Missing file: ", input_rds)
+}
+
+seurat_obj <- readRDS(input_rds)
+
+required_meta <- c("subtype", "celltype_major", "celltype_minor")
+missing_meta <- setdiff(required_meta, colnames(seurat_obj@meta.data))
+
+if (length(missing_meta) > 0) {
+  stop("Missing metadata columns: ", paste(missing_meta, collapse = ", "))
+}
+
+if (!"umap" %in% Reductions(seurat_obj)) {
+  stop(
+    "Missing global UMAP reduction named 'umap'. Available reductions: ",
+    paste(Reductions(seurat_obj), collapse = ", ")
+  )
+}
+
+local_umaps <- grep("^umap_local__", Reductions(seurat_obj), value = TRUE)
+
+if (length(local_umaps) == 0) {
+  stop("No precomputed local UMAP reductions found. Expected reductions starting with 'umap_local__'.")
+}
 
 Idents(seurat_obj) <- "celltype_major"
-majors_all  <- levels(Idents(seurat_obj))
-palMaj_all  <- colorRampPalette(brewer.pal(12, "Set3"))(length(majors_all))
-names(palMaj_all) <- majors_all
 
-# ---------------- UI ----------------
+subtypes_all <- sort(unique(as.character(seurat_obj$subtype)))
+majors_all <- sort(unique(as.character(seurat_obj$celltype_major)))
+genes_all <- rownames(seurat_obj)
+
+global_group_choices <- intersect(
+  c("celltype_major", "celltype_minor", "celltype_subset", "subtype", "seurat_clusters"),
+  colnames(seurat_obj@meta.data)
+)
+
+if (length(global_group_choices) == 0) {
+  global_group_choices <- "celltype_major"
+}
+
+minor_group_choices <- intersect(
+  c(
+    "celltype_minor",
+    "celltype_subset",
+    "local_recluster_cluster",
+    "local_recluster_cluster_full",
+    "seurat_clusters"
+  ),
+  colnames(seurat_obj@meta.data)
+)
+
+if (length(minor_group_choices) == 0) {
+  minor_group_choices <- "celltype_minor"
+}
+
+# ============================================================
+# UI
+# ============================================================
+
 ui <- navbarPage(
   id = "mainnav",
   theme = app_theme,
-  title = tagList(icon("microscope"), "BREAST (Breast cancer Expression Analysis Software Tool)"),
+  title = tagList(icon("microscope"), "BREAST"),
   
-  # -------- Home --------
+  header = tags$head(
+    tags$style(HTML("
+      body {
+        background-color: #fbfbfb;
+      }
+
+      .sidebar-section-title {
+        font-weight: 700;
+        color: #2f6f61;
+        margin-top: 8px;
+        margin-bottom: 10px;
+        font-size: 1rem;
+      }
+
+      .plot-card {
+        margin-bottom: 16px;
+      }
+
+      .card-header {
+        font-weight: 700;
+      }
+
+      .plot-card-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+      }
+
+      .plot-card-title {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .download-right {
+        margin-left: auto;
+        flex: 0 0 auto;
+      }
+
+      .resizable-plot-box {
+        resize: both;
+        overflow: auto;
+        min-width: 360px;
+        min-height: 280px;
+        width: 100%;
+        height: 430px;
+        border: 1px solid #eeeeee;
+        border-radius: 12px;
+        background: white;
+        padding: 4px;
+      }
+
+      .resizable-plot-box.jitter-box {
+        height: 360px;
+      }
+
+      .resizable-plot-box.chip-box {
+        height: 600px;
+      }
+
+      .resizable-plot-box .shiny-plot-output,
+      .resizable-plot-box .plotly.html-widget {
+        width: 100% !important;
+        height: 100% !important;
+      }
+
+      .de-info-box {
+        background: #ffffff;
+        border: 1px solid #e7e7e7;
+        border-radius: 14px;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+      }
+
+      .small-muted {
+        color: #777;
+        font-size: 0.82rem;
+      }
+
+      .shiny-input-container {
+        margin-bottom: 12px;
+      }
+
+      .chip-legend-item {
+        margin-right: 12px;
+        display: inline-block;
+        margin-bottom: 6px;
+      }
+
+      .chip-swatch {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        margin-right: 4px;
+        border-radius: 2px;
+        vertical-align: middle;
+      }
+    ")),
+    tags$script(HTML("
+      document.addEventListener('DOMContentLoaded', function() {
+        function attachResizeObservers() {
+          const boxes = document.querySelectorAll('.resizable-plot-box');
+          boxes.forEach(function(box) {
+            if (box.dataset.resizeObserverAttached === 'true') return;
+            box.dataset.resizeObserverAttached = 'true';
+            const ro = new ResizeObserver(function() {
+              window.dispatchEvent(new Event('resize'));
+              if (window.HTMLWidgets && HTMLWidgets.staticRender) {
+                setTimeout(function(){ HTMLWidgets.staticRender(); }, 50);
+              }
+            });
+            ro.observe(box);
+          });
+        }
+
+        attachResizeObservers();
+
+        const mo = new MutationObserver(function() {
+          attachResizeObservers();
+        });
+
+        mo.observe(document.body, { childList: true, subtree: true });
+      });
+    "))
+  ),
+  
   tabPanel(
     title = "Home",
     icon = icon("house"),
     fluidPage(
-      tags$head(tags$title("BREAST – Home")),
       br(),
       fluidRow(
         column(
           width = 6,
           card(
             class = "shadow-sm rounded-3 border-0",
-            card_header(tagList(icon("dna"), strong("BREAST - scRNA-Seq Viewer"))),
+            card_header(tagList(icon("dna"), strong("BREAST single-cell viewer"))),
             card_body(
-              p("Explore single-cell atlas, plot Feature/Jitter, recluster major cell subtypes, run differential expression analysis (Gene+ vs Gene- in a given population)."),
-              tags$ul(
-                tags$li("Requires: seurat_obj.rds"),
-                tags$li("Subsets by tumor subtype and major cell types")
-              ),
-              actionButton("go_scbreast", "Open BREAST", class = "btn btn-primary")
+              p("Explore breast cancer single-cell populations, gene expression and Gene+ versus Gene- differential expression."),
+              actionButton("go_viewer", "Open viewer", class = "btn btn-primary")
             )
           )
         ),
@@ -116,14 +554,10 @@ ui <- navbarPage(
           width = 6,
           card(
             class = "shadow-sm rounded-3 border-0",
-            card_header(tagList(icon("layer-group"), strong("T-47D ChIP Viewer"))),
+            card_header(tagList(icon("chart-line"), strong("T47-D ChIP viewer"))),
             card_body(
-              p("Visualize ChIP-Atlas peaks around any HGNC gene in T-47D and overlay ENCODE cCREs."),
-              tags$ul(
-                tags$li("Requires: T47D_formatted_50.bed, ENCFF389ZVZ_cCREs.bigBed"),
-                tags$li("Click points to open SRX at ChIP-Atlas")
-              ),
-              actionButton("go_chip", "Open T-47D ChIP Viewer", class = "btn btn-primary")
+              p("Visualize ChIP-Atlas peaks around any HGNC gene in T47-D and overlay ENCODE cCREs."),
+              actionButton("go_chip", "Open ChIP viewer", class = "btn btn-primary")
             )
           )
         )
@@ -131,159 +565,407 @@ ui <- navbarPage(
     )
   ),
   
-  # -------- scBREAST --------
   tabPanel(
-    title = "BREAST",
+    title = "Single-cell viewer",
     icon = icon("diagram-project"),
+    
     sidebarLayout(
       sidebarPanel(
         width = 3,
-        h5("Options", class = "text-primary fw-bold"),
         
-        selectInput("sc_subtype", "Select tumor subtype:",
-                    choices = sort(unique(seurat_obj$subtype)),
-                    selected = sort(unique(seurat_obj$subtype))[1]),
+        conditionalPanel(
+          condition = "input.sc_tabs == 'global_tab'",
+          
+          div(class = "sidebar-section-title", "Global UMAP"),
+          
+          selectInput(
+            "global_subtype",
+            "Cancer subtype",
+            choices = subtypes_all,
+            selected = subtypes_all[1]
+          ),
+          
+          selectizeInput(
+            "global_gene",
+            "Gene",
+            choices = NULL,
+            selected = NULL,
+            options = list(maxOptions = 5000)
+          ),
+          
+          selectInput(
+            "global_groupby",
+            "Color by",
+            choices = global_group_choices,
+            selected = if ("celltype_major" %in% global_group_choices) {
+              "celltype_major"
+            } else {
+              global_group_choices[1]
+            }
+          ),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Plot settings"),
+          
+          numericInput("global_pt_size", "UMAP point size", 0.45, min = 0.05, max = 3, step = 0.05),
+          numericInput("global_feature_pt_size", "Feature point size", 0.45, min = 0.05, max = 3, step = 0.05),
+          numericInput("global_jitter_pt_size", "Jitter point size", 0.35, min = 0.05, max = 2, step = 0.05),
+          numericInput("global_coord_ratio", "UMAP ratio", 1, min = 0.3, max = 3, step = 0.1),
+          numericInput("global_base_size", "Text size", 11, min = 6, max = 24, step = 1),
+          numericInput("global_legend_text", "Legend text size", 8, min = 5, max = 20, step = 1),
+          numericInput("global_legend_title", "Legend title size", 9, min = 5, max = 22, step = 1),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "PDF export"),
+          
+          textInput("global_filebase", "File basename", "Global_UMAP"),
+          numericInput("global_pdf_w", "Width, in", 5.2, min = 2, max = 16, step = 0.2),
+          numericInput("global_pdf_h", "Height, in", 4.2, min = 2, max = 16, step = 0.2)
+        ),
         
-        selectizeInput("sc_gene", "Select a gene:",
-                       choices = rownames(seurat_obj),
-                       selected = rownames(seurat_obj)[1],
-                       options = list(maxOptions = 5000)),
+        conditionalPanel(
+          condition = "input.sc_tabs == 'minor_tab'",
+          
+          div(class = "sidebar-section-title", "Major / minor populations"),
+          
+          selectInput(
+            "minor_subtype",
+            "Cancer subtype",
+            choices = subtypes_all,
+            selected = subtypes_all[1]
+          ),
+          
+          uiOutput("minor_major_ui"),
+          
+          selectizeInput(
+            "minor_gene",
+            "Gene",
+            choices = NULL,
+            selected = NULL,
+            options = list(maxOptions = 5000)
+          ),
+          
+          selectInput(
+            "minor_groupby",
+            "Color by",
+            choices = minor_group_choices,
+            selected = if ("celltype_minor" %in% minor_group_choices) {
+              "celltype_minor"
+            } else {
+              minor_group_choices[1]
+            }
+          ),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Plot settings"),
+          
+          numericInput("minor_pt_size", "UMAP point size", 0.55, min = 0.05, max = 3, step = 0.05),
+          numericInput("minor_feature_pt_size", "Feature point size", 0.55, min = 0.05, max = 3, step = 0.05),
+          numericInput("minor_jitter_pt_size", "Jitter point size", 0.35, min = 0.05, max = 2, step = 0.05),
+          numericInput("minor_coord_ratio", "UMAP ratio", 1, min = 0.3, max = 3, step = 0.1),
+          numericInput("minor_base_size", "Text size", 11, min = 6, max = 24, step = 1),
+          numericInput("minor_legend_text", "Legend text size", 8, min = 5, max = 20, step = 1),
+          numericInput("minor_legend_title", "Legend title size", 9, min = 5, max = 22, step = 1),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "PDF export"),
+          
+          textInput("minor_filebase", "File basename", "Local_UMAP"),
+          numericInput("minor_pdf_w", "Width, in", 5.2, min = 2, max = 16, step = 0.2),
+          numericInput("minor_pdf_h", "Height, in", 4.2, min = 2, max = 16, step = 0.2)
+        ),
         
-        radioButtons("sc_view", "Plot type:",
-                     choices  = c("FeaturePlot" = "feature", "Jitter" = "jitter"),
-                     selected = "feature"),
-        
-        hr(),
-        selectInput("sc_chosenMajor", "Subset by Major cell type (for Minor clusters / DE):",
-                    choices = majors_all, selected = majors_all[1]),
-        
-        hr(),
-        h6("Legend", class = "text-primary fw-bold"),
-        numericInput("sc_leg_text",  "Legend text size", 11, min = 6, max = 28, step = 1),
-        numericInput("sc_leg_title", "Legend title size", 12, min = 6, max = 32, step = 1),
-        numericInput("sc_leg_key",   "Legend key size (pt)", 8,  min = 4, max = 40, step = 1),
-        
-        hr(),
-        h6("Export PDF", class = "text-primary fw-bold"),
-        textInput("sc_filebase", "File name (no extension):", "BREAST_plot"),
-        numericInput("sc_w_in", "Width (in):", 6, min = 2, max = 20, step = 0.5),
-        numericInput("sc_h_in", "Height (in):", 5, min = 2, max = 20, step = 0.5),
-        
-        hr(),
-        h5("FindMarkers (Gene+ vs Gene−)", class = "text-primary fw-bold"),
-        helpText("Compare Gene+ vs Gene− (threshold) in subtype, optionally restricted to 1 major cell type."),
-        selectInput("sc_de_scope", "Scope:",
-                    choices = c("All cells in subtype" = "all",
-                                "Only selected Major cell type" = "major"),
-                    selected = "major"),
-        numericInput("sc_de_thresh", "Gene+ threshold (expr > thresh)", value = 0, min = 0, step = 0.1),
-        numericInput("sc_de_min_cells", "Min cells per group", value = 30, min = 5, step = 5),
-        selectInput("sc_de_test", "Test:", choices = c("wilcox","MAST","LR"), selected = "wilcox"),
-        actionButton("sc_de_run", "Run FindMarkers", class = "btn btn-outline-primary w-100"),
-        br(), br(),
-        downloadButton("sc_de_dl_csv", "Download DE CSV", class = "btn btn-sm btn-primary w-100"),
-        
-        hr(),
-        tags$p("Julian Primig", class = "text-muted small")
+        conditionalPanel(
+          condition = "input.sc_tabs == 'de_tab'",
+          
+          div(class = "sidebar-section-title", "Gene+ versus Gene-"),
+          
+          selectInput(
+            "de_subtype",
+            "Cancer subtype",
+            choices = subtypes_all,
+            selected = subtypes_all[1]
+          ),
+          
+          selectizeInput(
+            "de_gene",
+            "Gene defining Gene+ cells",
+            choices = NULL,
+            selected = NULL,
+            options = list(maxOptions = 5000)
+          ),
+          
+          selectInput(
+            "de_scope",
+            "Cells to compare",
+            choices = c(
+              "All cells in subtype" = "all",
+              "Selected major cell type" = "major",
+              "Selected minor annotation" = "minor_annotation"
+            ),
+            selected = "major"
+          ),
+          
+          conditionalPanel(
+            condition = "input.de_scope == 'major' || input.de_scope == 'minor_annotation'",
+            uiOutput("de_major_ui")
+          ),
+          
+          conditionalPanel(
+            condition = "input.de_scope == 'minor_annotation'",
+            selectInput(
+              "de_minor_groupby",
+              "Minor annotation column",
+              choices = minor_group_choices,
+              selected = if ("celltype_minor" %in% minor_group_choices) {
+                "celltype_minor"
+              } else {
+                minor_group_choices[1]
+              }
+            ),
+            uiOutput("de_minor_level_ui")
+          ),
+          
+          numericInput("de_thresh", "Gene+ threshold", 0, min = 0, step = 0.1),
+          numericInput("de_min_cells", "Minimum cells per group", 30, min = 5, step = 5),
+          selectInput("de_test", "Statistical test", choices = c("wilcox", "MAST", "LR"), selected = "wilcox"),
+          
+          actionButton("de_run", "Run analysis", class = "btn btn-primary w-100"),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Volcano settings"),
+          
+          numericInput("de_logfc_cut", "|logFC| cutoff", 0.25, min = 0, step = 0.05),
+          numericInput("de_padj_cut", "Adjusted p-value cutoff", 0.05, min = 0, max = 1, step = 0.01),
+          numericInput("de_label_n", "Number of labels", 12, min = 0, max = 50, step = 1),
+          numericInput("de_base_size", "Text size", 11, min = 6, max = 24, step = 1),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Export"),
+          
+          textInput("de_filebase", "File basename", "Gene_DE"),
+          numericInput("de_pdf_w", "Width, in", 5.4, min = 2, max = 16, step = 0.2),
+          numericInput("de_pdf_h", "Height, in", 4.4, min = 2, max = 16, step = 0.2),
+          downloadButton("de_dl_csv", "Download CSV", class = "btn btn-sm btn-primary w-100")
+        )
       ),
       
       mainPanel(
         width = 9,
-        div(style = "max-height: 85vh; overflow-y: auto; padding-right: 10px;",
-            tabsetPanel(
-              tabPanel("Global UMAP",
-                       div(class = "d-flex justify-content-between align-items-center",
-                           tags$div(),
-                           downloadButton("sc_dl_refUMAP", "Download PDF", class = "btn-sm")),
-                       plotOutput("sc_refUMAP", height = "500px")),
+        
+        div(
+          style = "max-height: 86vh; overflow-y: auto; padding-right: 10px;",
+          
+          tabsetPanel(
+            id = "sc_tabs",
+            
+            tabPanel(
+              title = "Global UMAP",
+              value = "global_tab",
               
-              tabPanel("Expression",
-                       conditionalPanel("input.sc_view=='feature'",
-                                        div(class = "d-flex justify-content-between align-items-center",
-                                            tags$div(),
-                                            downloadButton("sc_dl_feature", "Download PDF", class = "btn-sm")),
-                                        plotOutput("sc_featurePlot", height = "500px")),
-                       conditionalPanel("input.sc_view=='jitter'",
-                                        div(class = "d-flex justify-content-between align-items-center",
-                                            tags$div(),
-                                            downloadButton("sc_dl_jitter", "Download PDF", class = "btn-sm")),
-                                        plotOutput("sc_jitterPlot", height = "500px"))),
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Global UMAP"),
+                    downloadButton("global_dl_umap", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box", plotOutput("global_umap", width = "100%", height = "100%"))
+                )
+              ),
               
-              tabPanel("Minor clusters",
-                       h4(textOutput("sc_titleMinor"), class = "fw-bold text-primary"),
-                       div(class = "d-flex justify-content-between align-items-center",
-                           tags$div(),
-                           downloadButton("sc_dl_minorUMAP", "Download PDF", class = "btn-sm")),
-                       plotOutput("sc_minorUMAP", height = "500px"),
-                       div(class = "d-flex justify-content-between align-items-center",
-                           tags$div(),
-                           downloadButton("sc_dl_minorFeature", "Download PDF", class = "btn-sm")),
-                       plotOutput("sc_minorFeaturePlot", height = "500px")),
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Expression by population"),
+                    downloadButton("global_dl_jitter", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box jitter-box", plotOutput("global_jitter", width = "100%", height = "100%"))
+                )
+              ),
               
-              tabPanel("DE (Gene+ vs Gene−)",
-                       tags$div(class="mt-2"),
-                       verbatimTextOutput("sc_de_summary"),
-                       tags$div(class="mt-2"),
-                       plotOutput("sc_de_volcano", height = "350px"),
-                       tags$div(class="mt-2"),
-                       DTOutput("sc_de_table"))
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Feature plot"),
+                    downloadButton("global_dl_feature", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box", plotOutput("global_feature", width = "100%", height = "100%"))
+                )
+              )
+            ),
+            
+            tabPanel(
+              title = "Major / minor cell types",
+              value = "minor_tab",
+              
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", textOutput("minor_title", inline = TRUE)),
+                    downloadButton("minor_dl_umap", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box", plotOutput("minor_umap", width = "100%", height = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Expression by subpopulation"),
+                    downloadButton("minor_dl_jitter", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box jitter-box", plotOutput("minor_jitter", width = "100%", height = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Feature plot"),
+                    downloadButton("minor_dl_feature", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box", plotOutput("minor_feature", width = "100%", height = "100%"))
+                )
+              )
+            ),
+            
+            tabPanel(
+              title = "Gene DE",
+              value = "de_tab",
+              
+              card(
+                class = "shadow-sm rounded-3 border-0",
+                card_header("Gene+ versus Gene- differential expression"),
+                card_body(
+                  fluidRow(
+                    column(
+                      width = 4,
+                      div(
+                        class = "de-info-box",
+                        verbatimTextOutput("de_summary")
+                      )
+                    ),
+                    column(
+                      width = 8,
+                      div(
+                        class = "de-info-box",
+                        tableOutput("de_group_table")
+                      )
+                    )
+                  ),
+                  
+                  div(
+                    class = "plot-card-header",
+                    h5(class = "plot-card-title", "Volcano plot"),
+                    downloadButton("de_dl_volcano", "PDF", class = "btn-sm download-right")
+                  ),
+                  
+                  div(class = "resizable-plot-box", plotOutput("de_volcano", width = "100%", height = "100%")),
+                  
+                  br(),
+                  
+                  h5("Results table"),
+                  DTOutput("de_table")
+                )
+              )
             )
+          )
         )
       )
     )
   ),
   
-  # -------- T-47D ChIP Viewer --------
   tabPanel(
-    title = "T-47D ChIP Viewer",
-    icon = icon("chart-scatter"),
+    title = "T47-D ChIP viewer",
+    icon = icon("chart-line"),
+    
     sidebarLayout(
       sidebarPanel(
         width = 3,
-        h5("Inputs", class = "text-primary fw-bold"),
-        textInput("chip_gene", "Gene name (HGNC)", "LINC00885"),
-        numericInput("chip_flank", "Flanking sequences (bp)", 2000, min = 0),
-        selectizeInput("chip_filter_factor", "Filter factor (optional)",
-                       choices = NULL, multiple = TRUE,
-                       options = list(placeholder = "All in region")),
-        numericInput("chip_minscore", "Min score", value = 0, min = 0, step = 1),
+        
+        div(class = "sidebar-section-title", "Inputs"),
+        
+        textInput("chip_gene", "Gene name, HGNC", "LINC00885"),
+        numericInput("chip_flank", "Flanking sequences, bp", 2000, min = 0),
+        
+        selectizeInput(
+          "chip_filter_factor",
+          "Filter factor",
+          choices = NULL,
+          multiple = TRUE,
+          options = list(placeholder = "All factors in region")
+        ),
+        
+        numericInput("chip_minscore", "Minimum score", 0, min = 0, step = 1),
         sliderInput("chip_ptsize", "Point size", min = 4, max = 14, value = 8, step = 1),
         checkboxInput("chip_showccre", "Show cCREs", value = TRUE),
         checkboxInput("chip_showlegend", "Show factor legend", value = TRUE),
         actionButton("chip_go", "Display", class = "btn btn-primary w-100 mb-2"),
+        
         hr(),
-        h6("Export PDF", class = "text-primary fw-bold"),
-        numericInput("chip_pdf_w", "Width (in)", value = 6, min = 3, max = 16, step = 0.5),
-        numericInput("chip_pdf_h", "Height (in)", value = 4, min = 3, max = 16, step = 0.5),
-        helpText("Tip: 3–3.5 in for single-column; 6–7 in for two-column figures.")
+        
+        div(class = "sidebar-section-title", "PDF export"),
+        
+        numericInput("chip_pdf_w", "Width, in", 6, min = 3, max = 16, step = 0.5),
+        numericInput("chip_pdf_h", "Height, in", 4, min = 3, max = 16, step = 0.5)
       ),
+      
       mainPanel(
         width = 9,
+        
         card(
           class = "shadow-sm rounded-3 border-0 mb-3",
           card_body(
             div(
-              class = "d-flex justify-content-between align-items-center mb-2",
+              class = "plot-card-header",
               tags$div(
-                tags$div(class = "app-title", "T-47D ChIP Viewer (All antibodies)"),
-                tags$div(class = "app-subtitle",
-                         "Explore ChIP-Atlas peaks for T-47D around any HGNC gene. Overlay ENCODE cCREs.",
-                         " Click a point to open its SRX on ChIP-Atlas.")
+                class = "plot-card-title",
+                tags$h4("T47-D ChIP viewer", class = "mb-1"),
+                tags$div(class = "small-muted", "ChIP-Atlas peaks and ENCODE cCREs around the selected locus.")
               ),
-              downloadButton("chip_dl_pdf", "Download PDF", class = "btn-sm btn-outline-primary")
+              downloadButton("chip_dl_pdf", "Download PDF", class = "btn-sm btn-outline-primary download-right")
             ),
-            div(class = "plot-wrapper",
-                plotlyOutput("chip_plot", height = "600px"),
-                div(class = "plot-helper text-muted",
-                    HTML("Click any point to open its SRX on <b>ChIP-Atlas</b> in a new tab."))
-            ),
+            
+            div(class = "resizable-plot-box chip-box", plotlyOutput("chip_plot", width = "100%", height = "100%")),
+            
             uiOutput("chip_ccreLegend"),
             uiOutput("chip_tfLegend")
           )
         ),
+        
         card(
           class = "shadow-sm rounded-3 border-0",
-          card_header(tags$div(class = "fw-semibold", "Selected region")),
+          card_header("Selected region"),
           card_body(tableOutput("chip_regionInfo"))
         )
       )
@@ -291,314 +973,683 @@ ui <- navbarPage(
   )
 )
 
-# ---------------- SERVER ----------------
-server <- function(input, output, session){
+# ============================================================
+# Server
+# ============================================================
+
+server <- function(input, output, session) {
   
-  # ---- Home navigation ----
-  observeEvent(input$go_scbreast,  { updateNavbarPage(session, "mainnav", selected = "scBREAST") })
-  observeEvent(input$go_chip,      { updateNavbarPage(session, "mainnav", selected = "T-47D ChIP Viewer") })
+  observeEvent(input$go_viewer, {
+    updateNavbarPage(session, "mainnav", selected = "Single-cell viewer")
+  })
   
-  # ======================= scBREAST =======================
-  sc_apply_legend_theme <- function(p) {
-    p + theme(
-      legend.text     = element_text(size = input$sc_leg_text),
-      legend.title    = element_text(size = input$sc_leg_title),
-      legend.key.size = unit(input$sc_leg_key, "pt")
+  observeEvent(input$go_chip, {
+    updateNavbarPage(session, "mainnav", selected = "T47-D ChIP viewer")
+  })
+  
+  observe({
+    updateSelectizeInput(session, "global_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
+    updateSelectizeInput(session, "minor_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
+    updateSelectizeInput(session, "de_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
+  })
+  
+  # ============================================================
+  # Single-cell object helpers
+  # ============================================================
+  
+  subtype_cells <- function(subtype) {
+    colnames(seurat_obj)[as.character(seurat_obj$subtype) == as.character(subtype)]
+  }
+  
+  major_choices_for_subtype <- function(subtype) {
+    cells <- subtype_cells(subtype)
+    out <- sort(unique(as.character(seurat_obj$celltype_major[cells])))
+    out[!is.na(out)]
+  }
+  
+  output$minor_major_ui <- renderUI({
+    req(input$minor_subtype)
+    choices <- major_choices_for_subtype(input$minor_subtype)
+    selectInput("minor_major", "Major cell type", choices = choices, selected = choices[1])
+  })
+  
+  output$de_major_ui <- renderUI({
+    req(input$de_subtype)
+    choices <- major_choices_for_subtype(input$de_subtype)
+    selectInput("de_major", "Major cell type", choices = choices, selected = choices[1])
+  })
+  
+  # ============================================================
+  # Global object and plots
+  # ============================================================
+  
+  global_obj <- reactive({
+    req(input$global_subtype, input$global_groupby)
+    
+    cells <- subtype_cells(input$global_subtype)
+    
+    validate(
+      need(length(cells) > 0, "No cells available for the selected subtype."),
+      need(input$global_groupby %in% colnames(seurat_obj@meta.data), "Selected annotation not found.")
     )
-  }
-  
-  # Global re-clustering per subtype (as in your original design)
-  sc_baseObj <- reactive({
-    req(input$sc_subtype)
-    withProgress(message = "Clustering global microenvironment…", value = 0, {
-      sub <- subset(seurat_obj, subset = subtype == input$sc_subtype); incProgress(0.2)
-      sub <- NormalizeData(sub); incProgress(0.2)
-      sub <- FindVariableFeatures(sub, selection.method = "vst", nfeatures = 2000); incProgress(0.2)
-      sub <- ScaleData(sub, features = VariableFeatures(sub)); incProgress(0.2)
-      sub <- RunPCA(sub, features = VariableFeatures(sub)); incProgress(0.1)
-      sub <- FindNeighbors(sub, dims = 1:10)
-      sub <- FindClusters(sub, resolution = 0.5)
-      sub <- RunUMAP(sub, dims = 1:10)
-      Idents(sub) <- "celltype_major"; incProgress(0.1)
-      sub
-    })
-  })
-  
-  sc_dataGene <- reactive({
-    req(input$sc_gene)
-    FetchData(sc_baseObj(), vars = c(input$sc_gene, "celltype_major"))
-  })
-  
-  sc_recluster <- reactive({
-    req(input$sc_chosenMajor)
-    withProgress(message = paste("Clustering", input$sc_chosenMajor, "…"), value = 0, {
-      sub <- subset(sc_baseObj(), idents = input$sc_chosenMajor); incProgress(0.3)
-      sub <- NormalizeData(sub); incProgress(0.2)
-      sub <- ScaleData(sub); incProgress(0.2)
-      sub <- RunPCA(sub, features = VariableFeatures(sub)); incProgress(0.15)
-      sub <- FindNeighbors(sub, dims = 1:10)
-      sub <- FindClusters(sub, resolution = 0.5)
-      sub <- RunUMAP(sub, dims = 1:10); incProgress(0.15)
-      sub
-    })
-  })
-  
-  output$sc_titleMinor <- renderText({
-    req(input$sc_chosenMajor)
-    paste(input$sc_chosenMajor, "- reclustered & annotated by minor cell types")
-  })
-  
-  sc_plot_refUMAP <- reactive({
-    obj    <- sc_baseObj()
-    majors <- levels(Idents(obj))
-    pal    <- palMaj_all[majors]
-    p <- DimPlot(obj, reduction = "umap", cols = pal, pt.size = 0.5, label = FALSE) +
-      ggtitle(paste(input$sc_subtype, "microenvironment (reclustered)")) +
-      theme_minimal() +
-      theme(legend.position = "right", plot.title = element_text(hjust = 0.5))
-    sc_apply_legend_theme(p)
-  })
-  
-  sc_plot_jitter <- reactive({
-    df <- sc_dataGene()
-    ggplot(df, aes(x = celltype_major, y = .data[[input$sc_gene]], color = celltype_major)) +
-      geom_jitter(width = 0.2, size = 0.5, alpha = 0.7) +
-      theme_minimal() +
-      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
-      labs(title = paste(input$sc_gene, "in", input$sc_subtype, "microenvironment"),
-           x = NULL, y = input$sc_gene)
-  })
-  
-  sc_plot_feature <- reactive({
-    p <- FeaturePlot(sc_baseObj(), features = input$sc_gene, reduction = "umap",
-                     cols = c("lightgrey","darkred"), pt.size = 0.5, order = TRUE) +
-      ggtitle(paste("FeaturePlot –", input$sc_gene)) +
-      theme_minimal() +
-      theme(plot.title = element_text(hjust = 0.5), legend.position = "right")
-    sc_apply_legend_theme(p)
-  })
-  
-  sc_plot_minorUMAP <- reactive({
-    sub <- sc_recluster()
-    p <- DimPlot(sub, reduction = "umap", group.by = "celltype_minor", pt.size = 0.5) +
-      ggtitle("Minor clusters UMAP") +
-      theme_minimal() +
-      theme(legend.position = "right", plot.title = element_text(hjust = 0.5))
-    sc_apply_legend_theme(p)
-  })
-  
-  sc_plot_minorFeature <- reactive({
-    sub <- sc_recluster()
-    p <- FeaturePlot(sub, features = input$sc_gene, reduction = "umap",
-                     cols = c("lightgrey","darkred"), pt.size = 0.5, order = TRUE) +
-      ggtitle(paste(input$sc_gene, "in", input$sc_chosenMajor, "subset")) +
-      theme_minimal() +
-      theme(legend.position = "right", plot.title = element_text(hjust = 0.5))
-    sc_apply_legend_theme(p)
-  })
-  
-  output$sc_refUMAP          <- renderPlot({ sc_plot_refUMAP() })
-  output$sc_jitterPlot       <- renderPlot({ sc_plot_jitter() })
-  output$sc_featurePlot      <- renderPlot({ sc_plot_feature() })
-  output$sc_minorUMAP        <- renderPlot({ sc_plot_minorUMAP() })
-  output$sc_minorFeaturePlot <- renderPlot({ sc_plot_minorFeature() })
-  
-  sc_save_pdf <- function(plot_obj, file, w = input$sc_w_in, h = input$sc_h_in){
-    dev_fun <- if (isTRUE(capabilities("cairo"))) cairo_pdf else "pdf"
-    ggplot2::ggsave(filename = file, plot = plot_obj, device = dev_fun,
-                    width = w, height = h, units = "in", limitsize = FALSE)
-  }
-  
-  output$sc_dl_refUMAP <- downloadHandler(
-    filename = function() sprintf("%s__GlobalUMAP.pdf", input$sc_filebase),
-    content  = function(file) sc_save_pdf(sc_plot_refUMAP(), file)
-  )
-  output$sc_dl_jitter <- downloadHandler(
-    filename = function() sprintf("%s__Jitter_%s.pdf", input$sc_filebase, input$sc_gene),
-    content  = function(file) sc_save_pdf(sc_plot_jitter(), file)
-  )
-  output$sc_dl_feature <- downloadHandler(
-    filename = function() sprintf("%s__Feature_%s.pdf", input$sc_filebase, input$sc_gene),
-    content  = function(file) sc_save_pdf(sc_plot_feature(), file)
-  )
-  output$sc_dl_minorUMAP <- downloadHandler(
-    filename = function() sprintf("%s__MinorUMAP_%s.pdf", input$sc_filebase, input$sc_chosenMajor %||% "NA"),
-    content  = function(file) sc_save_pdf(sc_plot_minorUMAP(), file)
-  )
-  output$sc_dl_minorFeature <- downloadHandler(
-    filename = function() sprintf("%s__MinorFeature_%s_%s.pdf", input$sc_filebase, input$sc_chosenMajor %||% "NA", input$sc_gene),
-    content  = function(file) sc_save_pdf(sc_plot_minorFeature(), file)
-  )
-  
-  # ======================= DE: FindMarkers Gene+ vs Gene− =======================
-  sc_de_obj <- reactive({
-    obj <- sc_baseObj()
-    if (identical(input$sc_de_scope, "major")) {
-      req(input$sc_chosenMajor)
-      obj <- subset(obj, idents = input$sc_chosenMajor)
-    }
+    
+    obj <- subset(seurat_obj, cells = cells)
+    Idents(obj) <- input$global_groupby
     obj
   })
   
-  sc_de_result <- eventReactive(input$sc_de_run, {
-    req(input$sc_gene)
-    obj <- sc_de_obj()
+  global_palette <- reactive({
+    obj <- global_obj()
+    make_palette(obj@meta.data[[input$global_groupby]])
+  })
+  
+  global_umap_plot <- reactive({
+    obj <- global_obj()
+    pal <- global_palette()
     
-    # Expression for grouping
-    x <- FetchData(obj, vars = input$sc_gene)[, 1]
-    grp <- ifelse(x > input$sc_de_thresh, "Gene+", "Gene-")
-    grp <- factor(grp, levels = c("Gene-", "Gene+"))
-    obj$gene_group <- grp
-    Idents(obj) <- "gene_group"
+    DimPlot(
+      obj,
+      reduction = "umap",
+      group.by = input$global_groupby,
+      cols = pal,
+      pt.size = input$global_pt_size,
+      label = FALSE
+    ) +
+      labs(
+        title = paste0(input$global_subtype, " global UMAP"),
+        color = input$global_groupby
+      ) +
+      theme_umap(input$global_base_size) +
+      theme(
+        legend.position = "right",
+        legend.text = element_text(size = input$global_legend_text),
+        legend.title = element_text(size = input$global_legend_title)
+      ) +
+      coord_fixed(ratio = input$global_coord_ratio)
+  })
+  
+  global_data_gene <- reactive({
+    req(input$global_gene)
+    obj <- global_obj()
     
-    n_tab <- table(Idents(obj))
-    min_cells <- input$sc_de_min_cells
     validate(
-      need(all(c("Gene-","Gene+") %in% names(n_tab)), "Groups not formed correctly."),
-      need(n_tab[["Gene-"]] >= min_cells, paste0("Too few Gene- cells (", n_tab[["Gene-"]], ").")),
-      need(n_tab[["Gene+"]] >= min_cells, paste0("Too few Gene+ cells (", n_tab[["Gene+"]], ")."))
+      need(input$global_gene %in% rownames(obj), paste0("Gene not found: ", input$global_gene))
     )
     
-    withProgress(message = "Running FindMarkers (can be long)…", value = 0, {
+    FetchData(obj, vars = c(input$global_gene, input$global_groupby)) %>%
+      rownames_to_column("cell") %>%
+      rename(group = all_of(input$global_groupby)) %>%
+      mutate(group = factor(as.character(group), levels = names(global_palette())))
+  })
+  
+  global_jitter_plot <- reactive({
+    df <- global_data_gene()
+    pal <- global_palette()
+    
+    ggplot(df, aes(x = group, y = .data[[input$global_gene]], color = group)) +
+      geom_jitter(width = 0.18, size = input$global_jitter_pt_size, alpha = 0.55) +
+      stat_summary(
+        fun = median,
+        geom = "crossbar",
+        width = 0.42,
+        fatten = 0,
+        color = "black",
+        linewidth = 0.28
+      ) +
+      scale_color_manual(values = pal, drop = FALSE) +
+      labs(title = input$global_gene, x = NULL, y = "Expression") +
+      theme_paper(input$global_base_size) +
+      theme(
+        legend.position = "none",
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+      )
+  })
+  
+  global_feature_plot <- reactive({
+    req(input$global_gene)
+    obj <- global_obj()
+    
+    make_manual_feature_plot(
+      obj = obj,
+      reduction = "umap",
+      gene = input$global_gene,
+      pt_size = input$global_feature_pt_size,
+      base_size = input$global_base_size,
+      coord_ratio = input$global_coord_ratio,
+      title = paste0(input$global_gene, " expression"),
+      min_expr = 0,
+      max_quantile = 0.99
+    )
+  })
+  
+  output$global_umap <- renderPlot(global_umap_plot())
+  output$global_jitter <- renderPlot(global_jitter_plot())
+  output$global_feature <- renderPlot(global_feature_plot())
+  
+  output$global_dl_umap <- downloadHandler(
+    filename = function() paste0(input$global_filebase, "_UMAP_", input$global_subtype, ".pdf"),
+    content = function(file) save_pdf(global_umap_plot(), file, input$global_pdf_w, input$global_pdf_h)
+  )
+  
+  output$global_dl_jitter <- downloadHandler(
+    filename = function() paste0(input$global_filebase, "_Jitter_", input$global_subtype, "_", input$global_gene, ".pdf"),
+    content = function(file) save_pdf(global_jitter_plot(), file, input$global_pdf_w, input$global_pdf_h)
+  )
+  
+  output$global_dl_feature <- downloadHandler(
+    filename = function() paste0(input$global_filebase, "_Feature_", input$global_subtype, "_", input$global_gene, ".pdf"),
+    content = function(file) save_pdf(global_feature_plot(), file, input$global_pdf_w, input$global_pdf_h)
+  )
+  
+  # ============================================================
+  # Minor object and plots
+  # ============================================================
+  
+  minor_reduction <- reactive({
+    req(input$minor_subtype, input$minor_major)
+    make_local_reduction_name(input$minor_subtype, input$minor_major)
+  })
+  
+  minor_obj <- reactive({
+    req(input$minor_subtype, input$minor_major, input$minor_groupby)
+    
+    cells <- colnames(seurat_obj)[
+      as.character(seurat_obj$subtype) == as.character(input$minor_subtype) &
+        as.character(seurat_obj$celltype_major) == as.character(input$minor_major)
+    ]
+    
+    red <- minor_reduction()
+    
+    validate(
+      need(length(cells) > 0, "No cells available for the selected population."),
+      need(red %in% Reductions(seurat_obj), paste0("No local UMAP available for: ", input$minor_subtype, " / ", input$minor_major)),
+      need(input$minor_groupby %in% colnames(seurat_obj@meta.data), "Selected annotation not found.")
+    )
+    
+    obj <- subset(seurat_obj, cells = cells)
+    Idents(obj) <- input$minor_groupby
+    obj
+  })
+  
+  output$minor_title <- renderText({
+    req(input$minor_subtype, input$minor_major)
+    paste0(input$minor_subtype, " ", input$minor_major)
+  })
+  
+  minor_palette <- reactive({
+    obj <- minor_obj()
+    make_palette(obj@meta.data[[input$minor_groupby]])
+  })
+  
+  minor_umap_plot <- reactive({
+    obj <- minor_obj()
+    red <- minor_reduction()
+    pal <- minor_palette()
+    
+    validate(need(red %in% Reductions(obj), paste0("Reduction not found: ", red)))
+    
+    DimPlot(
+      obj,
+      reduction = red,
+      group.by = input$minor_groupby,
+      cols = pal,
+      pt.size = input$minor_pt_size,
+      label = FALSE
+    ) +
+      labs(
+        title = paste0(input$minor_subtype, " ", input$minor_major),
+        color = input$minor_groupby
+      ) +
+      theme_umap(input$minor_base_size) +
+      theme(
+        legend.position = "right",
+        legend.text = element_text(size = input$minor_legend_text),
+        legend.title = element_text(size = input$minor_legend_title)
+      ) +
+      coord_fixed(ratio = input$minor_coord_ratio)
+  })
+  
+  minor_data_gene <- reactive({
+    req(input$minor_gene)
+    obj <- minor_obj()
+    
+    validate(need(input$minor_gene %in% rownames(obj), paste0("Gene not found: ", input$minor_gene)))
+    
+    FetchData(obj, vars = c(input$minor_gene, input$minor_groupby)) %>%
+      rownames_to_column("cell") %>%
+      rename(group = all_of(input$minor_groupby)) %>%
+      mutate(group = factor(as.character(group), levels = names(minor_palette())))
+  })
+  
+  minor_jitter_plot <- reactive({
+    df <- minor_data_gene()
+    pal <- minor_palette()
+    
+    ggplot(df, aes(x = group, y = .data[[input$minor_gene]], color = group)) +
+      geom_jitter(width = 0.18, size = input$minor_jitter_pt_size, alpha = 0.55) +
+      stat_summary(
+        fun = median,
+        geom = "crossbar",
+        width = 0.42,
+        fatten = 0,
+        color = "black",
+        linewidth = 0.28
+      ) +
+      scale_color_manual(values = pal, drop = FALSE) +
+      labs(title = input$minor_gene, x = NULL, y = "Expression") +
+      theme_paper(input$minor_base_size) +
+      theme(
+        legend.position = "none",
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+      )
+  })
+  
+  minor_feature_plot <- reactive({
+    req(input$minor_gene)
+    obj <- minor_obj()
+    red <- minor_reduction()
+    
+    make_manual_feature_plot(
+      obj = obj,
+      reduction = red,
+      gene = input$minor_gene,
+      pt_size = input$minor_feature_pt_size,
+      base_size = input$minor_base_size,
+      coord_ratio = input$minor_coord_ratio,
+      title = paste0(input$minor_gene, " expression"),
+      min_expr = 0,
+      max_quantile = 0.99
+    )
+  })
+  
+  output$minor_umap <- renderPlot(minor_umap_plot())
+  output$minor_jitter <- renderPlot(minor_jitter_plot())
+  output$minor_feature <- renderPlot(minor_feature_plot())
+  
+  output$minor_dl_umap <- downloadHandler(
+    filename = function() paste0(input$minor_filebase, "_UMAP_", input$minor_subtype, "_", input$minor_major, ".pdf"),
+    content = function(file) save_pdf(minor_umap_plot(), file, input$minor_pdf_w, input$minor_pdf_h)
+  )
+  
+  output$minor_dl_jitter <- downloadHandler(
+    filename = function() paste0(input$minor_filebase, "_Jitter_", input$minor_subtype, "_", input$minor_major, "_", input$minor_gene, ".pdf"),
+    content = function(file) save_pdf(minor_jitter_plot(), file, input$minor_pdf_w, input$minor_pdf_h)
+  )
+  
+  output$minor_dl_feature <- downloadHandler(
+    filename = function() paste0(input$minor_filebase, "_Feature_", input$minor_subtype, "_", input$minor_major, "_", input$minor_gene, ".pdf"),
+    content = function(file) save_pdf(minor_feature_plot(), file, input$minor_pdf_w, input$minor_pdf_h)
+  )
+  
+  # ============================================================
+  # DE
+  # ============================================================
+  
+  de_base_obj <- reactive({
+    req(input$de_subtype)
+    cells <- subtype_cells(input$de_subtype)
+    validate(need(length(cells) > 0, "No cells available for the selected subtype."))
+    subset(seurat_obj, cells = cells)
+  })
+  
+  de_major_obj <- reactive({
+    req(input$de_subtype, input$de_major)
+    obj <- de_base_obj()
+    cells <- colnames(obj)[as.character(obj$celltype_major) == as.character(input$de_major)]
+    validate(need(length(cells) > 0, "No cells available for the selected major cell type."))
+    subset(obj, cells = cells)
+  })
+  
+  output$de_minor_level_ui <- renderUI({
+    req(input$de_scope, input$de_major, input$de_minor_groupby)
+    
+    if (!identical(input$de_scope, "minor_annotation")) {
+      return(NULL)
+    }
+    
+    obj <- de_major_obj()
+    validate(need(input$de_minor_groupby %in% colnames(obj@meta.data), "Minor annotation not found."))
+    
+    levels_use <- sort(unique(as.character(obj@meta.data[[input$de_minor_groupby]])))
+    levels_use <- levels_use[!is.na(levels_use)]
+    
+    selectInput("de_minor_level", "Minor population", choices = levels_use, selected = levels_use[1])
+  })
+  
+  de_obj <- reactive({
+    if (identical(input$de_scope, "all")) {
+      obj <- de_base_obj()
+    } else if (identical(input$de_scope, "major")) {
+      obj <- de_major_obj()
+    } else {
+      req(input$de_minor_groupby, input$de_minor_level)
+      obj <- de_major_obj()
+      
+      cells <- colnames(obj)[
+        as.character(obj@meta.data[[input$de_minor_groupby]]) == as.character(input$de_minor_level)
+      ]
+      
+      validate(need(length(cells) > 0, "No cells available for the selected minor population."))
+      obj <- subset(obj, cells = cells)
+    }
+    
+    obj
+  })
+  
+  de_group_counts <- reactive({
+    req(input$de_gene)
+    obj <- de_obj()
+    
+    validate(need(input$de_gene %in% rownames(obj), paste0("Gene not found: ", input$de_gene)))
+    
+    x <- FetchData(obj, vars = input$de_gene)[, 1]
+    
+    data.frame(
+      group = c("Gene-", "Gene+"),
+      definition = c(
+        paste0(input$de_gene, " <= ", input$de_thresh),
+        paste0(input$de_gene, " > ", input$de_thresh)
+      ),
+      cells = c(sum(x <= input$de_thresh), sum(x > input$de_thresh))
+    )
+  })
+  
+  output$de_group_table <- renderTable(de_group_counts())
+  
+  de_result <- eventReactive(input$de_run, {
+    req(input$de_gene)
+    obj <- de_obj()
+    
+    validate(need(input$de_gene %in% rownames(obj), paste0("Gene not found: ", input$de_gene)))
+    
+    x <- FetchData(obj, vars = input$de_gene)[, 1]
+    
+    obj$gene_group <- factor(
+      ifelse(x > input$de_thresh, "Gene+", "Gene-"),
+      levels = c("Gene-", "Gene+")
+    )
+    
+    Idents(obj) <- "gene_group"
+    n_tab <- table(Idents(obj))
+    
+    validate(
+      need("Gene-" %in% names(n_tab), "Gene- group is missing."),
+      need("Gene+" %in% names(n_tab), "Gene+ group is missing."),
+      need(n_tab[["Gene-"]] >= input$de_min_cells, paste0("Too few Gene- cells: ", n_tab[["Gene-"]])),
+      need(n_tab[["Gene+"]] >= input$de_min_cells, paste0("Too few Gene+ cells: ", n_tab[["Gene+"]]))
+    )
+    
+    withProgress(message = "Running differential expression", value = 0, {
       incProgress(0.2)
+      
       res <- FindMarkers(
         obj,
         ident.1 = "Gene+",
         ident.2 = "Gene-",
-        test.use = input$sc_de_test,
+        test.use = input$de_test,
         logfc.threshold = 0,
         min.pct = 0.1,
         verbose = FALSE
       )
-      incProgress(0.7)
+      
+      incProgress(0.8)
+      
       out <- res %>%
-        tibble::rownames_to_column("gene") %>%
-        dplyr::arrange(p_val_adj, p_val)
-      attr(out, "n_geneplus")  <- as.integer(n_tab[["Gene+"]])
+        rownames_to_column("gene") %>%
+        arrange(p_val_adj, p_val)
+      
+      attr(out, "n_geneplus") <- as.integer(n_tab[["Gene+"]])
       attr(out, "n_geneminus") <- as.integer(n_tab[["Gene-"]])
-      attr(out, "thresh")      <- input$sc_de_thresh
+      attr(out, "gene") <- input$de_gene
+      attr(out, "threshold") <- input$de_thresh
+      attr(out, "test") <- input$de_test
+      attr(out, "subtype") <- input$de_subtype
+      attr(out, "scope") <- input$de_scope
+      attr(out, "major") <- input$de_major %||% NA
+      attr(out, "minor_groupby") <- input$de_minor_groupby %||% NA
+      attr(out, "minor_level") <- input$de_minor_level %||% NA
+      
       out
     })
   }, ignoreInit = TRUE)
   
-  output$sc_de_summary <- renderPrint({
-    res <- sc_de_result()
-    cat("DE: Gene+ vs Gene-\n")
-    cat("Subtype:", input$sc_subtype, "\n")
-    cat("Scope:", if (input$sc_de_scope == "major") paste0("Major = ", input$sc_chosenMajor) else "All cells in subtype", "\n")
-    cat("Gene:", input$sc_gene, "\n")
-    cat("Threshold: expr >", attr(res, "thresh"), "\n")
-    cat("Test:", input$sc_de_test, "\n")
-    cat("n(Gene+):", attr(res, "n_geneplus"), "\n")
-    cat("n(Gene-):", attr(res, "n_geneminus"), "\n")
-    cat("Markers:", nrow(res), "\n")
+  output$de_summary <- renderPrint({
+    res <- de_result()
+    
+    cat("Gene:", attr(res, "gene"), "\n")
+    cat("Subtype:", attr(res, "subtype"), "\n")
+    
+    if (attr(res, "scope") == "all") {
+      cat("Population: all cells\n")
+    }
+    
+    if (attr(res, "scope") == "major") {
+      cat("Population:", attr(res, "major"), "\n")
+    }
+    
+    if (attr(res, "scope") == "minor_annotation") {
+      cat("Major:", attr(res, "major"), "\n")
+      cat("Minor:", attr(res, "minor_level"), "\n")
+      cat("Annotation:", attr(res, "minor_groupby"), "\n")
+    }
+    
+    cat("Threshold:", attr(res, "threshold"), "\n")
+    cat("Test:", attr(res, "test"), "\n")
+    cat("Gene+ cells:", attr(res, "n_geneplus"), "\n")
+    cat("Gene- cells:", attr(res, "n_geneminus"), "\n")
+    cat("Genes tested:", nrow(res), "\n")
   })
   
-  output$sc_de_table <- renderDT({
-    res <- sc_de_result()
+  de_volcano_plot <- reactive({
+    res <- de_result()
+    
+    fc_col <- if ("avg_log2FC" %in% colnames(res)) {
+      "avg_log2FC"
+    } else if ("avg_logFC" %in% colnames(res)) {
+      "avg_logFC"
+    } else {
+      NULL
+    }
+    
+    validate(
+      need(!is.null(fc_col), "No logFC column found.")
+    )
+    
+    df <- res %>%
+      dplyr::mutate(
+        fc = .data[[fc_col]],
+        neglog10_padj = -log10(p_val_adj + 1e-300),
+        category = dplyr::case_when(
+          p_val_adj < input$de_padj_cut & fc >= input$de_logfc_cut ~ "Higher in Gene+",
+          p_val_adj < input$de_padj_cut & fc <= -input$de_logfc_cut ~ "Higher in Gene-",
+          TRUE ~ "Not significant"
+        )
+      )
+    
+    top_labels <- df %>%
+      dplyr::filter(category != "Not significant") %>%
+      dplyr::arrange(p_val_adj) %>%
+      dplyr::slice_head(n = input$de_label_n)
+    
+    p <- ggplot(df, aes(x = fc, y = neglog10_padj)) +
+      geom_vline(
+        xintercept = c(-input$de_logfc_cut, input$de_logfc_cut),
+        linetype = "dashed",
+        linewidth = 0.35,
+        color = "grey60"
+      ) +
+      geom_hline(
+        yintercept = -log10(input$de_padj_cut),
+        linetype = "dashed",
+        linewidth = 0.35,
+        color = "grey60"
+      ) +
+      geom_point(
+        aes(color = category),
+        size = 1.1,
+        alpha = 0.75
+      ) +
+      scale_color_manual(
+        values = c(
+          "Higher in Gene+" = "#B2182B",
+          "Higher in Gene-" = "#2166AC",
+          "Not significant" = "grey78"
+        )
+      ) +
+      labs(
+        title = paste0(input$de_gene, " Gene+ versus Gene-"),
+        x = fc_col,
+        y = "-log10 adjusted p-value",
+        color = NULL
+      ) +
+      theme_paper(input$de_base_size) +
+      theme(
+        legend.position = "top",
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey95", linewidth = 0.15)
+      )
+    
+    if (nrow(top_labels) > 0 && requireNamespace("ggrepel", quietly = TRUE)) {
+      p <- p +
+        ggrepel::geom_text_repel(
+          data = top_labels,
+          aes(label = gene),
+          size = 3,
+          max.overlaps = Inf,
+          box.padding = 0.35,
+          point.padding = 0.2,
+          min.segment.length = 0,
+          segment.color = "grey60",
+          show.legend = FALSE
+        )
+    } else if (nrow(top_labels) > 0) {
+      p <- p +
+        geom_text(
+          data = top_labels,
+          aes(label = gene),
+          size = 3,
+          vjust = -0.4,
+          show.legend = FALSE
+        )
+    }
+    
+    p
+  })
+  
+  output$de_volcano <- renderPlot(de_volcano_plot())
+  
+  output$de_table <- renderDT({
+    res <- de_result()
+    
     DT::datatable(
       res,
       rownames = FALSE,
-      options = list(
-        pageLength = 25,
-        scrollX = TRUE
-      )
+      filter = "top",
+      options = list(pageLength = 20, scrollX = TRUE)
     )
   })
   
-  output$sc_de_volcano <- renderPlot({
-    res <- sc_de_result()
-    req(nrow(res) > 0)
-    # compat Seurat v4/v5: la colonne peut s’appeler avg_log2FC ou avg_logFC
-    fc_col <- if ("avg_log2FC" %in% colnames(res)) "avg_log2FC" else if ("avg_logFC" %in% colnames(res)) "avg_logFC" else NULL
-    validate(need(!is.null(fc_col), "No logFC column found in FindMarkers output."))
-    
-    df <- res %>%
-      mutate(
-        neglog10_padj = -log10(p_val_adj + 1e-300),
-        fc = .data[[fc_col]]
-      )
-    
-    ggplot(df, aes(x = fc, y = neglog10_padj)) +
-      geom_point(size = 0.6, alpha = 0.7) +
-      theme_minimal() +
-      labs(
-        x = fc_col,
-        y = "-log10(adj p-value)",
-        title = "Volcano (Gene+ vs Gene−)"
-      )
-  })
-  
-  output$sc_de_dl_csv <- downloadHandler(
-    filename = function(){
-      scope_str <- if (input$sc_de_scope == "major") paste0("_", gsub("\\s+","_", input$sc_chosenMajor)) else "_ALL"
-      paste0("DE_", input$sc_subtype, scope_str, "_", input$sc_gene, "_thr", input$sc_de_thresh, ".csv")
-    },
-    content = function(file){
-      res <- sc_de_result()
-      readr::write_csv(res, file)
-    }
+  output$de_dl_csv <- downloadHandler(
+    filename = function() paste0(input$de_filebase, "_", input$de_subtype, "_", input$de_gene, ".csv"),
+    content = function(file) readr::write_csv(de_result(), file)
   )
   
-  # ======================= T-47D ChIP Viewer =======================
+  output$de_dl_volcano <- downloadHandler(
+    filename = function() paste0(input$de_filebase, "_Volcano_", input$de_subtype, "_", input$de_gene, ".pdf"),
+    content = function(file) save_pdf(de_volcano_plot(), file, input$de_pdf_w, input$de_pdf_h)
+  )
+  
+  # ============================================================
+  # T47-D ChIP viewer
+  # ============================================================
+  
   chip_regionGR <- eventReactive(input$chip_go, {
     sym <- trimws(input$chip_gene)
-    validate(need(nzchar(sym), "Please enter a gene symbol"))
-    txs <- genes(EnsDb.Hsapiens.v86, filter = GeneNameFilter(sym))
+    
+    validate(need(nzchar(sym), "Please enter a gene symbol."))
+    
+    txs <- genes(
+      EnsDb.Hsapiens.v86,
+      filter = GeneNameFilter(sym)
+    )
+    
     if (length(txs) == 0 && grepl("^ENSG\\d+", sym, ignore.case = TRUE)) {
-      txs <- genes(EnsDb.Hsapiens.v86, filter = GeneIdFilter(sym))
+      txs <- genes(
+        EnsDb.Hsapiens.v86,
+        filter = GeneIdFilter(sym)
+      )
     }
+    
     validate(need(length(txs) > 0, paste0("Gene not found in EnsDb.Hsapiens.v86: ", sym)))
+    
     gr <- range(txs) + input$chip_flank
-    seqlevelsStyle(gr) <- "UCSC"; genome(gr) <- "hg38"; seqlengths(gr) <- NA
+    seqlevelsStyle(gr) <- "UCSC"
+    genome(gr) <- "hg38"
+    seqlengths(gr) <- NA
     gr
   })
   
   chip_peaksRawInRegion <- reactive({
-    gr0 <- chip_regionGR(); req(gr0)
+    gr0 <- chip_regionGR()
+    req(gr0)
+    
     validate(need(file.exists(CFILE_T47D), paste0("Missing file: ", CFILE_T47D)))
-    df <- readr::read_tsv(CFILE_T47D,
-                          col_names = c("chrom","start","end","SRX","gene","score"),
-                          show_col_types = FALSE) %>%
+    
+    df <- readr::read_tsv(
+      CFILE_T47D,
+      col_names = c("chrom", "start", "end", "SRX", "gene", "score"),
+      show_col_types = FALSE
+    ) %>%
       mutate(
         start = as.numeric(start),
-        end   = as.numeric(end),
+        end = as.numeric(end),
         score = suppressWarnings(as.numeric(score))
       )
+    
     gr_df <- GRanges(df$chrom, IRanges(df$start, df$end))
-    sel   <- queryHits(findOverlaps(gr_df, gr0))
-    df    <- df[sel, , drop = FALSE]
-    validate(need(nrow(df) > 0, "No peaks in region"))
+    sel <- queryHits(findOverlaps(gr_df, gr0))
+    
+    df <- df[sel, , drop = FALSE]
+    
+    validate(need(nrow(df) > 0, "No peaks in region."))
+    
     df %>%
       mutate(
-        pos     = (start + end) / 2,
-        url     = paste0(SRX_URL_BASE, SRX),
+        pos = (start + end) / 2,
+        url = paste0(SRX_URL_BASE, SRX),
         tooltip = paste0(
-          "Type: TF (All antibodies)",
+          "Type: TF, all antibodies",
           "<br>Factor: ", gene,
           "<br>SRX: <a href='", SRX_URL_BASE, SRX, "' target='_blank'>", SRX, "</a>",
           "<br>", chrom, ":", start, "-", end,
-          "<br>Score (MACS2, 0–1000): ", score
+          "<br>Score: ", score
         )
       )
   })
   
   observeEvent(chip_peaksRawInRegion(), {
     df <- chip_peaksRawInRegion()
+    
     updateSelectizeInput(
       session,
       "chip_filter_factor",
-      choices  = sort(unique(df$gene)),
+      choices = sort(unique(df$gene)),
       selected = character(0),
-      server   = TRUE
+      server = TRUE
     )
   })
   
   chip_peaksInRegion <- reactive({
     df <- chip_peaksRawInRegion()
+    
     if (!is.null(input$chip_filter_factor) && length(input$chip_filter_factor) > 0) {
       df <- dplyr::filter(df, gene %in% input$chip_filter_factor)
     }
+    
     dplyr::filter(df, score >= input$chip_minscore)
   })
   
@@ -609,22 +1660,39 @@ server <- function(input, output, session){
   })
   
   output$chip_plot <- renderPlotly({
-    gr <- chip_regionGR(); req(gr)
-    df <- chip_peaksInRegion(); validate(need(nrow(df) > 0, "No data after filtering"))
-    tf_colors <- chip_legend_colors()
+    gr <- chip_regionGR()
+    req(gr)
     
+    df <- chip_peaksInRegion()
+    validate(need(nrow(df) > 0, "No data after filtering."))
+    
+    tf_colors <- chip_legend_colors()
     shapes <- NULL
+    
     if (isTRUE(input$chip_showccre) && !is.null(ccres)) {
       cc0 <- subsetByOverlaps(ccres, gr)
+      
       if (length(cc0) > 0) {
         ccdf <- tibble::as_tibble(cc0) %>%
-          transmute(x0 = start, x1 = end, cls = factor(creClass, levels = ccre_classes))
-        shapes <- lapply(seq_len(nrow(ccdf)), function(i){
+          transmute(
+            x0 = start,
+            x1 = end,
+            cls = factor(creClass, levels = ccre_classes)
+          )
+        
+        shapes <- lapply(seq_len(nrow(ccdf)), function(i) {
           list(
-            type = "rect", xref = "x", yref = "paper",
-            x0 = ccdf$x0[i], x1 = ccdf$x1[i], y0 = 0, y1 = 1,
+            type = "rect",
+            xref = "x",
+            yref = "paper",
+            x0 = ccdf$x0[i],
+            x1 = ccdf$x1[i],
+            y0 = 0,
+            y1 = 1,
             fillcolor = ccre_cols[as.character(ccdf$cls[i])],
-            opacity = 0.3, line = list(width = 0), layer = "below"
+            opacity = 0.3,
+            line = list(width = 0),
+            layer = "below"
           )
         })
       }
@@ -632,19 +1700,27 @@ server <- function(input, output, session){
     
     p <- plot_ly(
       df,
-      x = ~pos, y = ~score,
-      text = ~tooltip, hoverinfo = "text",
-      type = "scatter", mode = "markers",
+      x = ~pos,
+      y = ~score,
+      text = ~tooltip,
+      hoverinfo = "text",
+      type = "scatter",
+      mode = "markers",
       marker = list(size = input$chip_ptsize, opacity = 1),
-      color = ~gene, colors = tf_colors,
-      showlegend = FALSE, customdata = ~url
+      color = ~gene,
+      colors = tf_colors,
+      showlegend = FALSE,
+      customdata = ~url
     ) %>%
       layout(
-        title  = list(text = paste0("<b>T-47D cCREs and TFs within the ", input$chip_gene, " region</b>")),
+        title = list(text = paste0("<b>T47-D cCREs and TFs within the ", input$chip_gene, " region</b>")),
         shapes = shapes,
         margin = list(l = 96, r = 28, t = 64, b = 72),
-        xaxis  = list(title = paste0(as.character(seqnames(gr)), ":", start(gr), "-", end(gr)), automargin = TRUE),
-        yaxis  = list(title = list(text = "<b>MACS2 binding score</b>"), automargin = TRUE)
+        xaxis = list(
+          title = paste0(as.character(seqnames(gr)), ":", start(gr), "-", end(gr)),
+          automargin = TRUE
+        ),
+        yaxis = list(title = list(text = "<b>MACS2 binding score</b>"), automargin = TRUE)
       ) %>%
       config(displaylogo = FALSE, responsive = TRUE)
     
@@ -661,22 +1737,33 @@ server <- function(input, output, session){
   })
   
   chip_plot_static <- reactive({
-    gr  <- chip_regionGR(); req(gr)
-    df  <- chip_peaksInRegion(); validate(need(nrow(df) > 0, "No data after filtering"))
-    cols_tf <- chip_legend_colors()
+    gr <- chip_regionGR()
+    req(gr)
     
+    df <- chip_peaksInRegion()
+    validate(need(nrow(df) > 0, "No data after filtering."))
+    
+    cols_tf <- chip_legend_colors()
     ccre_df <- NULL
+    
     if (isTRUE(input$chip_showccre) && !is.null(ccres)) {
       cc0 <- subsetByOverlaps(ccres, gr)
+      
       if (length(cc0) > 0) {
         ccre_df <- tibble::as_tibble(cc0) %>%
-          transmute(xstart = start, xend = end, cls = creClass)
+          transmute(
+            xstart = start,
+            xend = end,
+            cls = creClass
+          )
       }
     }
     
     base <- ggplot() +
       theme_minimal(base_size = 12) +
       theme(
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey95", linewidth = 0.15),
         plot.title = element_text(face = "bold", hjust = 0.5),
         legend.position = if (isTRUE(input$chip_showlegend)) "right" else "none"
       )
@@ -685,7 +1772,13 @@ server <- function(input, output, session){
       base <- base +
         geom_rect(
           data = ccre_df,
-          aes(xmin = xstart, xmax = xend, ymin = -Inf, ymax = Inf, fill = cls),
+          aes(
+            xmin = xstart,
+            xmax = xend,
+            ymin = -Inf,
+            ymax = Inf,
+            fill = cls
+          ),
           inherit.aes = FALSE,
           alpha = 0.25,
           color = NA
@@ -694,74 +1787,93 @@ server <- function(input, output, session){
     }
     
     base +
-      geom_point(data = df, aes(x = pos, y = score, color = gene),
-                 size = input$chip_ptsize * 0.4, alpha = 0.9) +
-      scale_color_manual(values = cols_tf,
-                         guide = if (isTRUE(input$chip_showlegend)) "legend" else "none") +
+      geom_point(
+        data = df,
+        aes(x = pos, y = score, color = gene),
+        size = input$chip_ptsize * 0.4,
+        alpha = 0.9
+      ) +
+      scale_color_manual(
+        values = cols_tf,
+        guide = if (isTRUE(input$chip_showlegend)) "legend" else "none"
+      ) +
       labs(
-        title = paste0("T-47D ChIP peaks in ", input$chip_gene, " region"),
-        x     = paste0(as.character(seqnames(gr)), ":", start(gr), "-", end(gr)),
-        y     = "MACS2 binding score"
+        title = paste0("T47-D ChIP peaks in ", input$chip_gene, " region"),
+        x = paste0(as.character(seqnames(gr)), ":", start(gr), "-", end(gr)),
+        y = "MACS2 binding score"
       )
   })
   
   output$chip_dl_pdf <- downloadHandler(
     filename = function() paste0("T47D_ChIP_", input$chip_gene, ".pdf"),
-    content = function(file) {
-      p <- chip_plot_static()
-      dev_fun <- if (isTRUE(capabilities("cairo"))) cairo_pdf else "pdf"
-      ggplot2::ggsave(filename = file, plot = p, device = dev_fun,
-                      width = input$chip_pdf_w, height = input$chip_pdf_h,
-                      units = "in", limitsize = FALSE)
-    }
+    content = function(file) save_pdf(chip_plot_static(), file, input$chip_pdf_w, input$chip_pdf_h)
   )
   
   output$chip_ccreLegend <- renderUI({
-    if (!isTRUE(input$chip_showccre) || is.null(ccres)) return(NULL)
-    gr <- chip_regionGR(); req(gr)
+    if (!isTRUE(input$chip_showccre) || is.null(ccres)) {
+      return(NULL)
+    }
+    
+    gr <- chip_regionGR()
+    req(gr)
+    
     cc0 <- subsetByOverlaps(ccres, gr)
-    if (length(cc0) == 0) return(NULL)
+    
+    if (length(cc0) == 0) {
+      return(NULL)
+    }
+    
     present <- unique(as.character(cc0$creClass))
     present <- intersect(ccre_classes, present)
-    if (length(present) == 0) return(NULL)
+    
+    if (length(present) == 0) {
+      return(NULL)
+    }
+    
     items <- lapply(present, function(cls) {
-      tags$span(class = "ccre-item",
-                tags$span(class = "ccre-swatch", style = paste0("background:", ccre_cols[[cls]], ";")),
-                tags$span(cls))
+      tags$span(
+        class = "chip-legend-item",
+        tags$span(class = "chip-swatch", style = paste0("background:", ccre_cols[[cls]], ";")),
+        tags$span(cls)
+      )
     })
-    tags$div(
-      tags$div(class = "ccre-legend",
-               tags$span(class = "ccre-legend-title", "ENCODE cCRE:"),
-               items)
-    )
+    
+    tags$div(style = "margin-top:8px;", tags$strong("ENCODE cCRE: "), items)
   })
   
   output$chip_tfLegend <- renderUI({
-    if (!isTRUE(input$chip_showlegend)) return(NULL)
+    if (!isTRUE(input$chip_showlegend)) {
+      return(NULL)
+    }
+    
     cols <- chip_legend_colors()
-    if (length(cols) == 0) return(NULL)
+    
+    if (length(cols) == 0) {
+      return(NULL)
+    }
+    
     items <- lapply(names(cols), function(name) {
-      tags$div(class = "tf-item",
-               tags$span(class = "tf-swatch", style = paste0("background:", cols[[name]], ";")),
-               tags$span(name))
+      tags$span(
+        class = "chip-legend-item",
+        tags$span(class = "chip-swatch", style = paste0("background:", cols[[name]], ";")),
+        tags$span(name)
+      )
     })
-    tags$div(
-      class = "tf-legend",
-      tags$div(class = "tf-legend-title", "Factor legend:"),
-      tags$div(class = "tf-legend-grid", items)
-    )
+    
+    tags$div(style = "margin-top:8px;", tags$strong("Factor legend: "), items)
   })
   
   output$chip_regionInfo <- renderTable({
-    gr <- chip_regionGR(); req(gr)
+    gr <- chip_regionGR()
+    req(gr)
+    
     data.frame(
       Chromosome = as.character(seqnames(gr)),
-      Start      = start(gr),
-      End        = end(gr),
-      Width      = width(gr)
+      Start = start(gr),
+      End = end(gr),
+      Width = width(gr)
     )
   })
 }
 
 shinyApp(ui, server)
-
