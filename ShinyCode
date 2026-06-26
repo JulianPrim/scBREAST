@@ -1,3 +1,4 @@
+
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
@@ -58,10 +59,10 @@ priority_colors <- c(
   "B-cells" = "#9ACD32FF",
   "Plasmablasts" = "#8FBC8FFF",
   "PVL" = "#7E6148FF",
-  "Cancer Basal SC" = "#A73030FF",
-  "Cancer Cycling" = "#E64B35FF",
-  "Cancer Her2 SC" = "#2E8B57FF",
-  "Cancer LumA SC" = "#8FBC8FFF",
+  "Cancer Basal SC" = "#8FBC8FFF",
+  "Cancer Cycling" = "#2E8B57FF",
+  "Cancer Her2 SC" = "#FF8C00FF",
+  "Cancer LumA SC" = "#A73030FF",
   "Cancer LumB SC" = "#4682B4FF",
   "Mature Luminal" = "#4DBBD5FF",
   "Luminal Progenitors" = "#91D1C2FF",
@@ -185,17 +186,17 @@ make_local_reduction_name <- function(subtype, major) {
 }
 
 save_pdf <- function(plot_obj, file, w, h) {
-  dev_fun <- if (isTRUE(capabilities("cairo"))) cairo_pdf else "pdf"
-  
-  ggplot2::ggsave(
-    filename = file,
-    plot = plot_obj,
-    device = dev_fun,
+  grDevices::pdf(
+    file = file,
     width = w,
     height = h,
-    units = "in",
-    limitsize = FALSE
+    onefile = FALSE,
+    useDingbats = FALSE
   )
+  
+  print(plot_obj)
+  
+  grDevices::dev.off()
 }
 
 make_manual_feature_plot <- function(
@@ -1078,7 +1079,7 @@ server <- function(input, output, session) {
     
     FetchData(obj, vars = c(input$global_gene, input$global_groupby)) %>%
       rownames_to_column("cell") %>%
-      rename(group = all_of(input$global_groupby)) %>%
+      dplyr::rename(group = dplyr::all_of(input$global_groupby)) %>%
       mutate(group = factor(as.character(group), levels = names(global_palette())))
   })
   
@@ -1219,7 +1220,7 @@ server <- function(input, output, session) {
     
     FetchData(obj, vars = c(input$minor_gene, input$minor_groupby)) %>%
       rownames_to_column("cell") %>%
-      rename(group = all_of(input$minor_groupby)) %>%
+      dplyr::rename(group = dplyr::all_of(input$minor_groupby)) %>%
       mutate(group = factor(as.character(group), levels = names(minor_palette())))
   })
   
