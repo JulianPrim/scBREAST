@@ -1,4 +1,5 @@
 
+
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
@@ -197,6 +198,335 @@ save_pdf <- function(plot_obj, file, w, h) {
   print(plot_obj)
   
   grDevices::dev.off()
+}
+
+
+get_logfc_col <- function(df) {
+  if ("avg_log2FC" %in% colnames(df)) {
+    "avg_log2FC"
+  } else if ("avg_logFC" %in% colnames(df)) {
+    "avg_logFC"
+  } else {
+    NULL
+  }
+}
+
+parse_gene_ratio <- function(x) {
+  vapply(as.character(x), function(z) {
+    if (is.na(z) || !nzchar(z)) {
+      return(NA_real_)
+    }
+    if (grepl("/", z, fixed = TRUE)) {
+      nums <- suppressWarnings(as.numeric(strsplit(z, "/", fixed = TRUE)[[1]]))
+      if (length(nums) >= 2 && is.finite(nums[1]) && is.finite(nums[2]) && nums[2] != 0) {
+        return(nums[1] / nums[2])
+      }
+    }
+    suppressWarnings(as.numeric(z))
+  }, numeric(1))
+}
+
+wrap_label <- function(x, width = 42) {
+  vapply(as.character(x), function(z) {
+    paste(strwrap(z, width = width), collapse = "\n")
+  }, character(1))
+}
+
+empty_go_table <- function() {
+  tibble::tibble(
+    Direction = character(),
+    ID = character(),
+    Description = character(),
+    GeneRatio = character(),
+    BgRatio = character(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    qvalue = numeric(),
+    geneID = character(),
+    Count = numeric(),
+    GeneRatio_num = numeric(),
+    neglog10_padj = numeric(),
+    n_input_symbols = integer(),
+    n_mapped_entrez = integer()
+  )
+}
+
+go_enrich_direction <- function(
+    genes,
+    direction,
+    ont = "BP",
+    pvalue_cutoff = 0.05,
+    qvalue_cutoff = 0.20,
+    min_genes = 5
+) {
+  genes <- unique(as.character(genes))
+  genes <- genes[!is.na(genes) & nzchar(genes)]
+  
+  if (length(genes) < min_genes) {
+    return(empty_go_table())
+  }
+  
+  orgdb <- getFromNamespace("org.Hs.eg.db", "org.Hs.eg.db")
+  
+  mapped <- suppressWarnings(
+    clusterProfiler::bitr(
+      genes,
+      fromType = "SYMBOL",
+      toType = "ENTREZID",
+      OrgDb = orgdb
+    )
+  )
+  
+  mapped <- mapped[!is.na(mapped$ENTREZID), , drop = FALSE]
+  entrez <- unique(as.character(mapped$ENTREZID))
+  
+  if (length(entrez) < min_genes) {
+    return(empty_go_table())
+  }
+  
+  ego <- suppressWarnings(
+    clusterProfiler::enrichGO(
+      gene = entrez,
+      OrgDb = orgdb,
+      ont = ont,
+      pAdjustMethod = "BH",
+      pvalueCutoff = pvalue_cutoff,
+      qvalueCutoff = qvalue_cutoff,
+      readable = TRUE
+    )
+  )
+  
+  if (is.null(ego)) {
+    return(empty_go_table())
+  }
+  
+  out <- as.data.frame(ego)
+  
+  if (nrow(out) == 0) {
+    return(empty_go_table())
+  }
+  
+  out %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      Direction = direction,
+      Count = as.numeric(Count),
+      pvalue = as.numeric(pvalue),
+      p.adjust = as.numeric(p.adjust),
+      qvalue = as.numeric(qvalue),
+      GeneRatio = as.character(GeneRatio),
+      GeneRatio_num = parse_gene_ratio(GeneRatio),
+      neglog10_padj = -log10(p.adjust + 1e-300),
+      n_input_symbols = length(genes),
+      n_mapped_entrez = length(entrez)
+    ) %>%
+    dplyr::select(
+      Direction,
+      ID,
+      Description,
+      GeneRatio,
+      BgRatio,
+      pvalue,
+      p.adjust,
+      qvalue,
+      geneID,
+      Count,
+      GeneRatio_num,
+      neglog10_padj,
+      n_input_symbols,
+      n_mapped_entrez,
+      dplyr::everything()
+    )
+}
+
+run_go_from_de <- function(
+    de_df,
+    padj_cutoff = 0.05,
+    logfc_cutoff = 0,
+    ont = "BP",
+    pvalue_cutoff = 0.05,
+    qvalue_cutoff = 0.20,
+    min_genes = 5,
+    defining_gene = NULL
+) {
+  fc_col <- get_logfc_col(de_df)
+  
+  if (is.null(fc_col)) {
+    stop("No logFC column found in the DE result.")
+  }
+  
+  if (!requireNamespace("clusterProfiler", quietly = TRUE) ||
+      !requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop(
+      "GO enrichment requires Bioconductor packages clusterProfiler and org.Hs.eg.db. ",
+      "Install them with: BiocManager::install(c('clusterProfiler', 'org.Hs.eg.db'))"
+    )
+  }
+  
+  logfc_cutoff <- abs(as.numeric(logfc_cutoff %||% 0))
+  padj_cutoff <- as.numeric(padj_cutoff %||% 0.05)
+  
+  df <- de_df %>%
+    dplyr::mutate(
+      fc_for_go = .data[[fc_col]],
+      padj_for_go = if ("p_val_adj" %in% colnames(.)) p_val_adj else p_val
+    ) %>%
+    dplyr::filter(!is.na(gene), !is.na(fc_for_go), !is.na(padj_for_go))
+  
+  if (!is.null(defining_gene) && length(defining_gene) > 0 && !is.na(defining_gene)) {
+    df <- df %>% dplyr::filter(gene != defining_gene)
+  }
+  
+  up_genes <- df %>%
+    dplyr::filter(padj_for_go < padj_cutoff, fc_for_go > logfc_cutoff) %>%
+    dplyr::arrange(padj_for_go) %>%
+    dplyr::pull(gene) %>%
+    unique()
+  
+  down_genes <- df %>%
+    dplyr::filter(padj_for_go < padj_cutoff, fc_for_go < -logfc_cutoff) %>%
+    dplyr::arrange(padj_for_go) %>%
+    dplyr::pull(gene) %>%
+    unique()
+  
+  go_down <- go_enrich_direction(
+    genes = down_genes,
+    direction = "Higher in Gene-",
+    ont = ont,
+    pvalue_cutoff = pvalue_cutoff,
+    qvalue_cutoff = qvalue_cutoff,
+    min_genes = min_genes
+  )
+  
+  go_up <- go_enrich_direction(
+    genes = up_genes,
+    direction = "Higher in Gene+",
+    ont = ont,
+    pvalue_cutoff = pvalue_cutoff,
+    qvalue_cutoff = qvalue_cutoff,
+    min_genes = min_genes
+  )
+  
+  dplyr::bind_rows(go_down, go_up) %>%
+    dplyr::mutate(
+      Direction = factor(Direction, levels = c("Higher in Gene-", "Higher in Gene+"))
+    ) %>%
+    dplyr::arrange(p.adjust, pvalue)
+}
+
+make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
+  validate(need(nrow(go_df) > 0, "No GO term selected for plotting."))
+  
+  top_n <- max(1, as.integer(top_n %||% 10))
+  
+  plot_df <- go_df %>%
+    dplyr::mutate(
+      Direction = as.character(Direction),
+      Description = as.character(Description),
+      Term_label = wrap_label(Description, width = 42),
+      Count = as.numeric(Count),
+      p.adjust = as.numeric(p.adjust),
+      GeneRatio_num = if ("GeneRatio_num" %in% colnames(.)) {
+        as.numeric(GeneRatio_num)
+      } else {
+        parse_gene_ratio(GeneRatio)
+      }
+    ) %>%
+    dplyr::filter(!is.na(GeneRatio_num), !is.na(p.adjust), !is.na(Count)) %>%
+    dplyr::arrange(Direction, p.adjust, dplyr::desc(GeneRatio_num))
+  
+  validate(need(nrow(plot_df) > 0, "No plottable GO term after filtering."))
+  
+  plot_df <- plot_df %>%
+    dplyr::mutate(
+      Term_unique = paste(Direction, ID, Term_label, sep = "___")
+    )
+  
+  term_levels <- rev(unique(plot_df$Term_unique))
+  plot_df$Term_unique <- factor(plot_df$Term_unique, levels = term_levels)
+  
+  term_labels <- stats::setNames(
+    plot_df$Term_label[match(term_levels, plot_df$Term_unique)],
+    term_levels
+  )
+  
+  x_max <- max(plot_df$GeneRatio_num, na.rm = TRUE)
+  if (!is.finite(x_max) || x_max <= 0) {
+    x_max <- 0.1
+  }
+  
+  tile_x <- -max(x_max * 0.055, 0.006)
+  tile_w <- max(x_max * 0.018, 0.003)
+  
+  term_cols <- stats::setNames(safe_palette(length(term_levels)), term_levels)
+  
+  if (is.null(title) || !nzchar(as.character(title))) {
+    title <- NULL
+  }
+  
+  ggplot(plot_df, aes(x = GeneRatio_num, y = Term_unique)) +
+    geom_tile(
+      aes(x = tile_x, fill = Term_unique),
+      width = tile_w,
+      height = 0.78,
+      show.legend = FALSE
+    ) +
+    geom_segment(
+      aes(
+        x = 0,
+        xend = GeneRatio_num,
+        y = Term_unique,
+        yend = Term_unique,
+        color = p.adjust
+      ),
+      linewidth = 3,
+      lineend = "round"
+    ) +
+    geom_point(
+      aes(size = Count, color = p.adjust),
+      alpha = 0.98
+    ) +
+    facet_grid(Direction ~ ., scales = "free_y", space = "free_y") +
+    scale_y_discrete(labels = term_labels) +
+    scale_x_continuous(
+      limits = c(tile_x - tile_w, x_max * 1.08),
+      breaks = pretty(c(0, x_max), n = 4),
+      labels = function(x) ifelse(x < 0, "", sprintf("%.2f", x)),
+      expand = c(0, 0)
+    ) +
+    scale_fill_manual(values = term_cols, guide = "none") +
+    scale_color_gradientn(
+      colours = c("#D9817D", "#B69AAA", "#5E7FA8"),
+      name = "p.adjust",
+      oob = scales::squish
+    ) +
+    scale_size_continuous(
+      name = "Gene count",
+      range = c(3.5, 9)
+    ) +
+    labs(
+      title = title,
+      x = "GeneRatio",
+      y = NULL
+    ) +
+    theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 1),
+      axis.title.x = element_text(size = base_size + 2, color = "black"),
+      axis.text.x = element_text(size = base_size, color = "black", angle = 45, hjust = 1),
+      axis.text.y = element_text(size = base_size + 1, color = "#444444"),
+      strip.text.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "#D9D9D9", linewidth = 0.8),
+      axis.line.x = element_blank(),
+      axis.ticks = element_blank(),
+      legend.title = element_text(size = base_size, color = "black"),
+      legend.text = element_text(size = base_size - 1, color = "black"),
+      legend.position = "right",
+      panel.spacing.y = unit(1.3, "cm"),
+      plot.margin = margin(15, 20, 15, 20)
+    )
 }
 
 make_manual_feature_plot <- function(
@@ -482,6 +812,70 @@ ui <- navbarPage(
         margin-bottom: 12px;
       }
 
+      .de-section-card {
+        clear: both;
+        position: relative;
+        z-index: 1;
+        margin-bottom: 26px !important;
+        overflow: visible;
+      }
+
+      .de-table-box {
+        clear: both;
+        position: relative;
+        z-index: 1;
+        width: 100%;
+        max-width: 100%;
+        overflow: hidden;
+        background: #ffffff;
+        border: 1px solid #eeeeee;
+        border-radius: 12px;
+        padding: 8px;
+        margin-top: 8px;
+        margin-bottom: 8px;
+      }
+
+      .results-table-box {
+        min-height: 420px;
+      }
+
+      .go-table-box {
+        min-height: 500px;
+      }
+
+      .de-table-box .datatables,
+      .de-table-box .dataTables_wrapper,
+      .de-table-box .html-widget {
+        width: 100% !important;
+        position: relative !important;
+        z-index: 1;
+      }
+
+      .de-table-box table.dataTable th,
+      .de-table-box table.dataTable td {
+        white-space: nowrap;
+        vertical-align: top;
+      }
+
+      .de-table-box .dataTables_scrollBody {
+        border-bottom: 1px solid #dddddd !important;
+      }
+
+      .de-volcano-box {
+        height: 480px;
+        min-height: 360px;
+      }
+
+      .de-go-dotplot-box {
+        height: 660px;
+        min-height: 520px;
+      }
+
+      .de-violin-box {
+        height: 640px;
+        min-height: 460px;
+      }
+
       .small-muted {
         color: #777;
         font-size: 0.82rem;
@@ -739,6 +1133,41 @@ ui <- navbarPage(
           
           hr(),
           
+          div(class = "sidebar-section-title", "GO enrichment"),
+          
+          selectInput(
+            "de_go_ont",
+            "GO ontology",
+            choices = c(
+              "Biological process" = "BP",
+              "Molecular function" = "MF",
+              "Cellular component" = "CC"
+            ),
+            selected = "BP"
+          ),
+          numericInput("de_go_de_padj_cut", "DE adjusted p-value cutoff", 0.05, min = 0, max = 1, step = 0.01),
+          numericInput("de_go_logfc_min", "Minimum |logFC| for GO", 0, min = 0, step = 0.05),
+          numericInput("de_go_p_cut", "GO p-value cutoff", 0.05, min = 0, max = 1, step = 0.01),
+          numericInput("de_go_q_cut", "GO q-value cutoff", 0.20, min = 0, max = 1, step = 0.01),
+          numericInput("de_go_min_genes", "Minimum genes per direction", 5, min = 3, max = 100, step = 1),
+          numericInput("de_go_top_n", "Terms shown in dotplot", 10, min = 1, max = 50, step = 1),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Gene+ / Gene- violin plot"),
+          
+          selectizeInput(
+            "de_violin_genes",
+            "Genes to plot",
+            choices = NULL,
+            selected = NULL,
+            multiple = TRUE,
+            options = list(maxOptions = 5000, placeholder = "Default: top DE genes")
+          ),
+          numericInput("de_violin_cols", "Facet columns", 3, min = 1, max = 6, step = 1),
+          
+          hr(),
+          
           div(class = "sidebar-section-title", "Volcano settings"),
           
           numericInput("de_logfc_cut", "|logFC| cutoff", 0.25, min = 0, step = 0.05),
@@ -865,7 +1294,7 @@ ui <- navbarPage(
               value = "de_tab",
               
               card(
-                class = "shadow-sm rounded-3 border-0",
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
                 card_header("Gene+ versus Gene- differential expression"),
                 card_body(
                   fluidRow(
@@ -883,20 +1312,79 @@ ui <- navbarPage(
                         tableOutput("de_group_table")
                       )
                     )
-                  ),
-                  
+                  )
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header(
                   div(
                     class = "plot-card-header",
-                    h5(class = "plot-card-title", "Volcano plot"),
+                    span(class = "plot-card-title", "Volcano plot"),
                     downloadButton("de_dl_volcano", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box de-volcano-box", plotOutput("de_volcano", width = "100%", height = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header("Results table"),
+                card_body(
+                  tags$div(
+                    class = "small-muted mb-2",
+                    "Differential expression results for Gene+ versus Gene- cells."
                   ),
-                  
-                  div(class = "resizable-plot-box", plotOutput("de_volcano", width = "100%", height = "100%")),
-                  
-                  br(),
-                  
-                  h5("Results table"),
-                  DTOutput("de_table")
+                  div(class = "de-table-box results-table-box", DTOutput("de_table", width = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "GO enrichment table"),
+                    downloadButton("de_dl_go_csv", "CSV", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  tags$div(
+                    class = "small-muted mb-2",
+                    "Select or deselect GO terms in this table to control the dotplot below. By default, the top GO terms are selected."
+                  ),
+                  div(class = "de-table-box go-table-box", DTOutput("de_go_table", width = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "GO enrichment dotplot"),
+                    downloadButton("de_dl_go_dotplot", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box de-go-dotplot-box", plotOutput("de_go_dotplot", width = "100%", height = "100%"))
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Expression violin plot: Gene+ versus Gene- cells"),
+                    downloadButton("de_dl_violin", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  div(class = "resizable-plot-box de-violin-box", plotOutput("de_violin", width = "100%", height = "100%"))
                 )
               )
             )
@@ -992,6 +1480,7 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "global_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
     updateSelectizeInput(session, "minor_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
     updateSelectizeInput(session, "de_gene", choices = genes_all, selected = genes_all[1], server = TRUE)
+    updateSelectizeInput(session, "de_violin_genes", choices = genes_all, selected = character(0), server = TRUE)
   })
   
   # ============================================================
@@ -1550,13 +2039,329 @@ server <- function(input, output, session) {
       res,
       rownames = FALSE,
       filter = "top",
-      options = list(pageLength = 20, scrollX = TRUE)
+      class = "compact stripe hover row-border nowrap",
+      options = list(
+        pageLength = 10,
+        lengthMenu = c(10, 20, 50, 100),
+        scrollX = TRUE,
+        scrollY = "300px",
+        scrollCollapse = TRUE,
+        autoWidth = FALSE,
+        dom = "lfrtip"
+      )
     )
   })
   
   output$de_dl_csv <- downloadHandler(
     filename = function() paste0(input$de_filebase, "_", input$de_subtype, "_", input$de_gene, ".csv"),
     content = function(file) readr::write_csv(de_result(), file)
+  )
+  
+  # ------------------------------------------------------------
+  # GO enrichment from DE results
+  # ------------------------------------------------------------
+  
+  de_go_result <- reactive({
+    res <- de_result()
+    
+    withProgress(message = "Running GO enrichment", value = 0, {
+      incProgress(0.1)
+      
+      go <- run_go_from_de(
+        de_df = res,
+        padj_cutoff = input$de_go_de_padj_cut,
+        logfc_cutoff = input$de_go_logfc_min,
+        ont = input$de_go_ont,
+        pvalue_cutoff = input$de_go_p_cut,
+        qvalue_cutoff = input$de_go_q_cut,
+        min_genes = input$de_go_min_genes,
+        defining_gene = attr(res, "gene")
+      )
+      
+      incProgress(0.9)
+      go
+    })
+  })
+  
+  de_go_table_data <- reactive({
+    go <- de_go_result()
+    
+    validate(
+      need(nrow(go) > 0, "No enriched GO term found. Try relaxing the DE p-value, GO p-value/q-value, or |logFC| thresholds.")
+    )
+    
+    go %>%
+      dplyr::arrange(p.adjust, pvalue) %>%
+      dplyr::mutate(
+        Direction = as.character(Direction),
+        Description = as.character(Description)
+      )
+  })
+  
+  de_go_default_rows <- reactive({
+    df <- de_go_table_data()
+    seq_len(min(nrow(df), max(1, as.integer(input$de_go_top_n %||% 10))))
+  })
+  
+  de_go_selected_data <- reactive({
+    df <- de_go_table_data()
+    sel <- input$de_go_table_rows_selected
+    
+    if (is.null(sel) || length(sel) == 0) {
+      sel <- de_go_default_rows()
+    }
+    
+    sel <- sel[sel >= 1 & sel <= nrow(df)]
+    validate(need(length(sel) > 0, "Select at least one GO term in the GO table."))
+    
+    df[sel, , drop = FALSE]
+  })
+  
+  output$de_go_table <- renderDT({
+    df <- de_go_table_data()
+    
+    show_df <- df %>%
+      dplyr::select(
+        Direction,
+        ID,
+        Description,
+        GeneRatio,
+        Count,
+        pvalue,
+        p.adjust,
+        qvalue,
+        geneID,
+        n_input_symbols,
+        n_mapped_entrez
+      )
+    
+    DT::datatable(
+      show_df,
+      rownames = FALSE,
+      filter = "top",
+      selection = list(mode = "multiple", selected = de_go_default_rows()),
+      class = "compact stripe hover row-border nowrap",
+      options = list(
+        pageLength = 8,
+        lengthMenu = c(8, 12, 20, 50),
+        scrollX = TRUE,
+        scrollY = "330px",
+        scrollCollapse = TRUE,
+        autoWidth = FALSE,
+        order = list(list(6, "asc")),
+        dom = "lfrtip"
+      )
+    ) %>%
+      DT::formatSignif(columns = c("pvalue", "p.adjust", "qvalue"), digits = 3)
+  })
+  
+  de_go_dotplot_plot <- reactive({
+    go_sel <- de_go_selected_data()
+    
+    make_go_dotplot(
+      go_df = go_sel,
+      top_n = input$de_go_top_n,
+      base_size = input$de_base_size,
+      title = NULL
+    )
+  })
+  
+  output$de_go_dotplot <- renderPlot(de_go_dotplot_plot())
+  
+  output$de_dl_go_csv <- downloadHandler(
+    filename = function() paste0(input$de_filebase, "_GO_", input$de_go_ont, "_", input$de_subtype, "_", input$de_gene, ".csv"),
+    content = function(file) readr::write_csv(de_go_table_data(), file)
+  )
+  
+  output$de_dl_go_dotplot <- downloadHandler(
+    filename = function() paste0(input$de_filebase, "_GO_Dotplot_", input$de_go_ont, "_", input$de_subtype, "_", input$de_gene, ".pdf"),
+    content = function(file) save_pdf(de_go_dotplot_plot(), file, input$de_pdf_w, input$de_pdf_h)
+  )
+  
+  # ------------------------------------------------------------
+  # Violin plot: selected genes in Gene+ versus Gene- cells
+  # ------------------------------------------------------------
+  
+  de_default_violin_genes <- reactive({
+    res <- de_result()
+    genes <- res %>%
+      dplyr::filter(gene != attr(res, "gene")) %>%
+      dplyr::arrange(p_val_adj, p_val) %>%
+      dplyr::slice_head(n = 9) %>%
+      dplyr::pull(gene) %>%
+      unique()
+    
+    genes[genes %in% rownames(de_obj())]
+  })
+  
+  observeEvent(de_result(), {
+    default_genes <- de_default_violin_genes()
+    
+    updateSelectizeInput(
+      session,
+      "de_violin_genes",
+      choices = genes_all,
+      selected = default_genes,
+      server = TRUE
+    )
+  }, ignoreInit = TRUE)
+  
+  de_violin_data <- reactive({
+    res <- de_result()
+    obj <- de_obj()
+    
+    selected_genes <- input$de_violin_genes
+    
+    if (is.null(selected_genes) || length(selected_genes) == 0) {
+      selected_genes <- de_default_violin_genes()
+    }
+    
+    selected_genes <- unique(as.character(selected_genes))
+    genes_present <- selected_genes[selected_genes %in% rownames(obj)]
+    genes_missing <- setdiff(selected_genes, genes_present)
+    
+    validate(
+      need(length(genes_present) > 0, "No selected violin-plot gene was found in the object."),
+      need(length(genes_present) <= 36, "Please select 36 genes or fewer for the violin plot."),
+      need(requireNamespace("tidyr", quietly = TRUE), "The violin plot requires the tidyr package. Install it with install.packages('tidyr').")
+    )
+    
+    fetch_vars <- unique(c(attr(res, "gene"), genes_present))
+    expr_df <- FetchData(obj, vars = fetch_vars) %>%
+      tibble::rownames_to_column("Cell")
+    
+    defining_gene <- attr(res, "gene")
+    group_neg <- paste0(defining_gene, "-")
+    group_pos <- paste0(defining_gene, "+")
+    group_levels <- c(group_neg, group_pos)
+    
+    expr_df$gene_group <- factor(
+      ifelse(expr_df[[defining_gene]] > attr(res, "threshold"), group_pos, group_neg),
+      levels = group_levels
+    )
+    
+    plot_df <- expr_df %>%
+      dplyr::select(Cell, gene_group, dplyr::all_of(genes_present)) %>%
+      tidyr::pivot_longer(
+        cols = dplyr::all_of(genes_present),
+        names_to = "Gene",
+        values_to = "Expression"
+      ) %>%
+      dplyr::mutate(
+        Gene = factor(Gene, levels = genes_present),
+        gene_group = factor(gene_group, levels = group_levels)
+      )
+    
+    attr(plot_df, "genes_missing") <- genes_missing
+    attr(plot_df, "group_levels") <- group_levels
+    attr(plot_df, "defining_gene") <- defining_gene
+    plot_df
+  })
+  
+  de_violin_plot <- reactive({
+    plot_df <- de_violin_data()
+    group_levels <- attr(plot_df, "group_levels")
+    defining_gene <- attr(plot_df, "defining_gene")
+    
+    stat_df <- plot_df %>%
+      dplyr::group_by(Gene) %>%
+      dplyr::summarise(
+        p_value = tryCatch(
+          stats::wilcox.test(Expression ~ gene_group)$p.value,
+          error = function(e) NA_real_
+        ),
+        y.position = max(Expression, na.rm = TRUE) * 1.10 + 0.05,
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        p_adj = stats::p.adjust(p_value, method = "BH"),
+        stars = dplyr::case_when(
+          is.na(p_adj) ~ "ns",
+          p_adj < 1e-4 ~ "****",
+          p_adj < 1e-3 ~ "***",
+          p_adj < 1e-2 ~ "**",
+          p_adj < 0.05 ~ "*",
+          TRUE ~ "ns"
+        )
+      )
+    
+    stat_df_sig <- stat_df %>%
+      dplyr::filter(stars != "ns") %>%
+      dplyr::mutate(
+        x_start = 1.28,
+        x_end = 1.72,
+        x_text = 1.50,
+        y_line = y.position * 0.965
+      )
+    
+    cols_groups <- stats::setNames(c("#9FC7AA", "#C97C7C"), group_levels)
+    n_cols <- max(1, as.integer(input$de_violin_cols %||% 3))
+    
+    ggplot(
+      plot_df,
+      aes(x = gene_group, y = Expression, fill = gene_group)
+    ) +
+      geom_violin(
+        width = 0.82,
+        scale = "width",
+        trim = TRUE,
+        color = "#2F2F2F",
+        linewidth = 0.55,
+        alpha = 0.95
+      ) +
+      stat_summary(
+        fun = median,
+        fun.min = median,
+        fun.max = median,
+        geom = "errorbar",
+        width = 0.16,
+        linewidth = 0.75,
+        color = "#111111"
+      ) +
+      geom_segment(
+        data = stat_df_sig,
+        aes(x = x_start, xend = x_end, y = y_line, yend = y_line),
+        inherit.aes = FALSE,
+        linewidth = 0.55,
+        color = "#111111",
+        lineend = "round"
+      ) +
+      geom_text(
+        data = stat_df_sig,
+        aes(x = x_text, y = y.position, label = stars),
+        inherit.aes = FALSE,
+        size = 3.4,
+        fontface = "bold",
+        color = "#111111"
+      ) +
+      facet_wrap(~ Gene, ncol = n_cols, scales = "free_y") +
+      scale_fill_manual(values = cols_groups, guide = "none") +
+      labs(
+        x = NULL,
+        y = "norm logUMI/cell",
+        title = NULL
+      ) +
+      coord_cartesian(clip = "off") +
+      theme_classic(base_size = input$de_base_size) +
+      theme(
+        plot.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = input$de_base_size - 2, color = "black"),
+        axis.text.y = element_text(size = input$de_base_size - 2, color = "black"),
+        axis.title.y = element_text(size = input$de_base_size, color = "black"),
+        strip.background = element_blank(),
+        strip.text = element_text(size = input$de_base_size, face = "italic", color = "black"),
+        legend.position = "none",
+        panel.spacing.x = unit(0.75, "lines"),
+        panel.spacing.y = unit(0.85, "lines"),
+        plot.margin = margin(10, 15, 10, 10)
+      )
+  })
+  
+  output$de_violin <- renderPlot(de_violin_plot())
+  
+  output$de_dl_violin <- downloadHandler(
+    filename = function() paste0(input$de_filebase, "_Violin_", input$de_subtype, "_", input$de_gene, ".pdf"),
+    content = function(file) save_pdf(de_violin_plot(), file, input$de_pdf_w, input$de_pdf_h)
   )
   
   output$de_dl_volcano <- downloadHandler(
@@ -1878,3 +2683,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
