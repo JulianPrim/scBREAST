@@ -1,5 +1,4 @@
 
-
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
@@ -414,7 +413,18 @@ run_go_from_de <- function(
     dplyr::arrange(p.adjust, pvalue)
 }
 
-make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
+make_go_dotplot <- function(
+    go_df,
+    top_n = 10,
+    base_size = 11,
+    title = NULL,
+    term_text_size = NULL,
+    wrap_width = 42,
+    panel_spacing_y = 0.35,
+    tile_height = 0.58,
+    segment_width = 2.7,
+    point_range = c(3.2, 8.5)
+) {
   validate(need(nrow(go_df) > 0, "No GO term selected for plotting."))
   
   top_n <- max(1, as.integer(top_n %||% 10))
@@ -423,7 +433,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
     dplyr::mutate(
       Direction = as.character(Direction),
       Description = as.character(Description),
-      Term_label = wrap_label(Description, width = 42),
+      Term_label = wrap_label(Description, width = wrap_width),
       Count = as.numeric(Count),
       p.adjust = as.numeric(p.adjust),
       GeneRatio_num = if ("GeneRatio_num" %in% colnames(.)) {
@@ -468,7 +478,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
     geom_tile(
       aes(x = tile_x, fill = Term_unique),
       width = tile_w,
-      height = 0.78,
+      height = tile_height,
       show.legend = FALSE
     ) +
     geom_segment(
@@ -479,7 +489,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
         yend = Term_unique,
         color = p.adjust
       ),
-      linewidth = 3,
+      linewidth = segment_width,
       lineend = "round"
     ) +
     geom_point(
@@ -502,7 +512,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
     ) +
     scale_size_continuous(
       name = "Gene count",
-      range = c(3.5, 9)
+      range = point_range
     ) +
     labs(
       title = title,
@@ -514,7 +524,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
       plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 1),
       axis.title.x = element_text(size = base_size + 2, color = "black"),
       axis.text.x = element_text(size = base_size, color = "black", angle = 45, hjust = 1),
-      axis.text.y = element_text(size = base_size + 1, color = "#444444"),
+      axis.text.y = element_text(size = term_text_size %||% (base_size + 1), color = "#444444"),
       strip.text.y = element_blank(),
       panel.grid.major.y = element_blank(),
       panel.grid.minor = element_blank(),
@@ -524,7 +534,7 @@ make_go_dotplot <- function(go_df, top_n = 10, base_size = 11, title = NULL) {
       legend.title = element_text(size = base_size, color = "black"),
       legend.text = element_text(size = base_size - 1, color = "black"),
       legend.position = "right",
-      panel.spacing.y = unit(1.3, "cm"),
+      panel.spacing.y = unit(panel_spacing_y, "cm"),
       plot.margin = margin(15, 20, 15, 20)
     )
 }
@@ -633,6 +643,300 @@ make_manual_feature_plot <- function(
     coord_fixed(ratio = coord_ratio)
 }
 
+
+# ============================================================
+# Discovery module helpers
+# ============================================================
+
+get_assay_data_safe <- function(obj, slot_or_layer = "data") {
+  assay_use <- Seurat::DefaultAssay(obj)
+  out <- tryCatch(
+    Seurat::GetAssayData(obj, assay = assay_use, layer = slot_or_layer),
+    error = function(e) {
+      Seurat::GetAssayData(obj, assay = assay_use, slot = slot_or_layer)
+    }
+  )
+  out
+}
+
+parse_signature_genes <- function(x) {
+  x <- as.character(x %||% "")
+  genes <- unlist(strsplit(x, "[,;\\s]+", perl = TRUE))
+  genes <- trimws(genes)
+  genes <- genes[nzchar(genes)]
+  unique(genes)
+}
+
+match_gene_symbols <- function(query_genes, available_genes) {
+  query_genes <- unique(as.character(query_genes))
+  query_genes <- query_genes[!is.na(query_genes) & nzchar(query_genes)]
+  available_genes <- as.character(available_genes)
+  map <- stats::setNames(available_genes, toupper(available_genes))
+  out <- unname(map[toupper(query_genes)])
+  unique(out[!is.na(out) & nzchar(out)])
+}
+
+empty_discovery_table <- function() {
+  tibble::tibble(
+    gene = character(),
+    correlation = numeric(),
+    p.value = numeric(),
+    p.adjust = numeric(),
+    avg_expr = numeric(),
+    pct_expr = numeric(),
+    association_score = numeric(),
+    direction = character()
+  )
+}
+
+get_go_annotation_for_genes <- function(genes) {
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE) ||
+      !requireNamespace("org.Hs.eg.db", quietly = TRUE) ||
+      !requireNamespace("GO.db", quietly = TRUE)) {
+    stop(
+      "GO discovery requires Bioconductor packages AnnotationDbi, org.Hs.eg.db and GO.db. ",
+      "Install them with: BiocManager::install(c('AnnotationDbi', 'org.Hs.eg.db', 'GO.db'))"
+    )
+  }
+  
+  orgdb <- getFromNamespace("org.Hs.eg.db", "org.Hs.eg.db")
+  genes <- unique(as.character(genes))
+  genes <- genes[!is.na(genes) & nzchar(genes)]
+  
+  org_cols <- AnnotationDbi::columns(orgdb)
+  if (all(c("GOALL", "ONTOLOGYALL") %in% org_cols)) {
+    ann <- suppressWarnings(
+      AnnotationDbi::select(
+        orgdb,
+        keys = genes,
+        keytype = "SYMBOL",
+        columns = c("SYMBOL", "GOALL", "ONTOLOGYALL")
+      )
+    ) %>%
+      dplyr::rename(GO = GOALL, ONTOLOGY = ONTOLOGYALL)
+  } else {
+    ann <- suppressWarnings(
+      AnnotationDbi::select(
+        orgdb,
+        keys = genes,
+        keytype = "SYMBOL",
+        columns = c("SYMBOL", "GO", "ONTOLOGY")
+      )
+    )
+  }
+  
+  ann <- ann %>%
+    dplyr::filter(!is.na(SYMBOL), !is.na(GO), !is.na(ONTOLOGY)) %>%
+    dplyr::distinct(SYMBOL, GO, ONTOLOGY)
+  
+  if (nrow(ann) == 0) {
+    return(tibble::tibble(SYMBOL = character(), GO = character(), ONTOLOGY = character(), TERM = character()))
+  }
+  
+  go_info <- suppressWarnings(
+    AnnotationDbi::select(
+      GO.db::GO.db,
+      keys = unique(ann$GO),
+      keytype = "GOID",
+      columns = c("TERM", "ONTOLOGY")
+    )
+  )
+  
+  go_info <- go_info %>%
+    dplyr::rename(GO = GOID, GO_ONTOLOGY = ONTOLOGY) %>%
+    dplyr::distinct(GO, TERM, GO_ONTOLOGY)
+  
+  ann %>%
+    dplyr::left_join(go_info, by = "GO") %>%
+    dplyr::mutate(
+      TERM = ifelse(is.na(TERM), GO, TERM),
+      ONTOLOGY = ifelse(is.na(ONTOLOGY), GO_ONTOLOGY, ONTOLOGY)
+    ) %>%
+    dplyr::select(SYMBOL, GO, ONTOLOGY, TERM) %>%
+    dplyr::distinct()
+}
+
+run_signature_gene_association <- function(
+    obj,
+    signature_genes,
+    min_pct = 0.05,
+    exclude_signature = TRUE,
+    max_cells = 10000,
+    random_seed = 1
+) {
+  signature_genes <- match_gene_symbols(signature_genes, rownames(obj))
+  
+  if (length(signature_genes) < 2) {
+    stop("At least two signature genes must be present in the selected object.")
+  }
+  
+  mat <- get_assay_data_safe(obj, "data")
+  cells_use <- colnames(obj)
+  cells_use <- intersect(cells_use, colnames(mat))
+  
+  if (length(cells_use) < 3) {
+    stop("Too few cells in the selected population.")
+  }
+  
+  max_cells <- as.integer(max_cells %||% 10000)
+  if (is.finite(max_cells) && max_cells > 0 && length(cells_use) > max_cells) {
+    set.seed(as.integer(random_seed %||% 1))
+    cells_use <- sample(cells_use, max_cells)
+  }
+  
+  mat <- mat[, cells_use, drop = FALSE]
+  signature_genes <- intersect(signature_genes, rownames(mat))
+  
+  if (length(signature_genes) < 2) {
+    stop("Too few signature genes are present after subsetting.")
+  }
+  
+  score <- Matrix::colMeans(mat[signature_genes, , drop = FALSE])
+  score <- as.numeric(score)
+  
+  if (stats::sd(score, na.rm = TRUE) == 0 || !is.finite(stats::sd(score, na.rm = TRUE))) {
+    stop("The signature score has zero variance in the selected cells.")
+  }
+  
+  min_pct <- as.numeric(min_pct %||% 0.05)
+  min_pct <- min(max(min_pct, 0), 1)
+  pct_all <- Matrix::rowMeans(mat > 0)
+  genes_test <- names(pct_all)[pct_all >= min_pct]
+  
+  if (isTRUE(exclude_signature)) {
+    genes_test <- setdiff(genes_test, signature_genes)
+  }
+  
+  genes_test <- intersect(genes_test, rownames(mat))
+  
+  if (length(genes_test) < 5) {
+    stop("Too few genes pass the expression filter.")
+  }
+  
+  mat_test <- mat[genes_test, , drop = FALSE]
+  n <- ncol(mat_test)
+  y_centered <- score - mean(score, na.rm = TRUE)
+  y_ss <- sum(y_centered^2, na.rm = TRUE)
+  
+  x_mean <- Matrix::rowMeans(mat_test)
+  x_ss <- Matrix::rowSums(mat_test^2) - n * (x_mean^2)
+  numerator <- as.numeric(mat_test %*% y_centered)
+  denom <- sqrt(as.numeric(x_ss) * y_ss)
+  correlation <- numerator / denom
+  correlation[!is.finite(correlation)] <- NA_real_
+  
+  pval <- rep(NA_real_, length(correlation))
+  ok <- !is.na(correlation) & abs(correlation) < 1 & n > 2
+  tstat <- correlation[ok] * sqrt((n - 2) / pmax(1 - correlation[ok]^2, .Machine$double.eps))
+  pval[ok] <- 2 * stats::pt(-abs(tstat), df = n - 2)
+  pval[!ok & !is.na(correlation) & abs(correlation) >= 1] <- 0
+  padj <- stats::p.adjust(pval, method = "BH")
+  
+  out <- tibble::tibble(
+    gene = genes_test,
+    correlation = as.numeric(correlation),
+    p.value = as.numeric(pval),
+    p.adjust = as.numeric(padj),
+    avg_expr = as.numeric(x_mean),
+    pct_expr = as.numeric(pct_all[genes_test]),
+    association_score = correlation * (-log10(padj + 1e-300)),
+    direction = dplyr::case_when(
+      correlation > 0 ~ "Positive association",
+      correlation < 0 ~ "Negative association",
+      TRUE ~ "No association"
+    )
+  ) %>%
+    dplyr::arrange(p.adjust, dplyr::desc(abs(correlation)))
+  
+  attr(out, "signature_genes") <- signature_genes
+  attr(out, "n_cells") <- n
+  attr(out, "n_genes_tested") <- length(genes_test)
+  attr(out, "score_mean") <- mean(score)
+  attr(out, "score_sd") <- stats::sd(score)
+  out
+}
+
+make_discovery_association_plot <- function(
+    df,
+    top_n = NULL,
+    base_size = 11,
+    gene_text_size = NULL,
+    title = NULL
+) {
+  validate(need(nrow(df) > 0, "No discovery result to plot."))
+  
+  if (!is.null(top_n) && is.finite(as.numeric(top_n))) {
+    top_n <- max(1, as.integer(top_n))
+    pos <- df %>%
+      dplyr::filter(!is.na(correlation), correlation > 0) %>%
+      dplyr::arrange(dplyr::desc(correlation), p.adjust) %>%
+      dplyr::slice_head(n = top_n)
+    
+    neg <- df %>%
+      dplyr::filter(!is.na(correlation), correlation < 0) %>%
+      dplyr::arrange(correlation, p.adjust) %>%
+      dplyr::slice_head(n = top_n)
+    
+    plot_input <- dplyr::bind_rows(neg, pos)
+  } else {
+    plot_input <- df %>%
+      dplyr::filter(!is.na(correlation), correlation != 0) %>%
+      dplyr::arrange(correlation)
+  }
+  
+  plot_df <- plot_input %>%
+    dplyr::mutate(
+      gene = factor(gene, levels = gene[order(correlation)]),
+      neglog10_padj = -log10(p.adjust + 1e-300),
+      direction = factor(direction, levels = c("Negative association", "Positive association"))
+    )
+  
+  validate(need(nrow(plot_df) > 0, "No positive or negative associated gene to plot."))
+  
+  if (is.null(title) || !nzchar(as.character(title))) {
+    title <- "Genes associated with signature score"
+  }
+  
+  ggplot(plot_df, aes(x = correlation, y = gene)) +
+    geom_vline(xintercept = 0, color = "grey55", linewidth = 0.35) +
+    geom_segment(
+      aes(x = 0, xend = correlation, y = gene, yend = gene, color = direction),
+      linewidth = 1.3,
+      alpha = 0.9,
+      lineend = "round"
+    ) +
+    geom_point(
+      aes(size = neglog10_padj, color = direction),
+      alpha = 0.95
+    ) +
+    scale_color_manual(
+      values = c(
+        "Negative association" = "#3C5488FF",
+        "Positive association" = "#8BC7A7"
+      ),
+      drop = FALSE
+    ) +
+    scale_size_continuous(name = expression(-log[10](adjusted~p)), range = c(2.8, 7.8)) +
+    labs(
+      title = title,
+      x = "Pearson correlation with signature score",
+      y = NULL,
+      color = NULL
+    ) +
+    theme_paper(base_size) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 1),
+      axis.text.y = element_text(size = gene_text_size %||% (base_size + 1), color = "#333333"),
+      axis.text.x = element_text(size = base_size, color = "#333333"),
+      axis.title.x = element_text(size = base_size + 1, face = "bold"),
+      legend.position = "right",
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "grey88", linewidth = 0.35),
+      plot.margin = margin(10, 20, 10, 20)
+    )
+}
+
 # ============================================================
 # ChIP viewer constants
 # ============================================================
@@ -702,6 +1006,7 @@ if (length(local_umaps) == 0) {
 Idents(seurat_obj) <- "celltype_major"
 
 subtypes_all <- sort(unique(as.character(seurat_obj$subtype)))
+de_subtype_choices <- c("ALL", subtypes_all)
 majors_all <- sort(unique(as.character(seurat_obj$celltype_major)))
 genes_all <- rownames(seurat_obj)
 
@@ -867,7 +1172,16 @@ ui <- navbarPage(
       }
 
       .de-go-dotplot-box {
-        height: 660px;
+        height: 520px;
+        min-height: 240px;
+      }
+
+      .discovery-plot-box {
+        height: 520px;
+        min-height: 280px;
+      }
+
+      .discovery-table-box {
         min-height: 520px;
       }
 
@@ -938,10 +1252,10 @@ ui <- navbarPage(
           width = 6,
           card(
             class = "shadow-sm rounded-3 border-0",
-            card_header(tagList(icon("dna"), strong("BREAST single-cell viewer"))),
+            card_header(tagList(icon("dna"), strong("BREAST single-cell analyser"))),
             card_body(
               p("Explore breast cancer single-cell populations, gene expression and Gene+ versus Gene- differential expression."),
-              actionButton("go_viewer", "Open viewer", class = "btn btn-primary")
+              actionButton("go_viewer", "Open analyser", class = "btn btn-primary")
             )
           )
         ),
@@ -961,7 +1275,7 @@ ui <- navbarPage(
   ),
   
   tabPanel(
-    title = "Single-cell viewer",
+    title = "Single-cell analyser",
     icon = icon("diagram-project"),
     
     sidebarLayout(
@@ -1075,6 +1389,111 @@ ui <- navbarPage(
         ),
         
         conditionalPanel(
+          condition = "input.sc_tabs == 'discovery_tab'",
+          
+          div(class = "sidebar-section-title", "Discovery: signature / GO term"),
+          
+          radioButtons(
+            "disc_signature_mode",
+            "Signature source",
+            choices = c("GO term" = "go", "Custom gene signature" = "custom"),
+            selected = "go"
+          ),
+          
+          conditionalPanel(
+            condition = "input.disc_signature_mode == 'go'",
+            selectInput(
+              "disc_go_ont",
+              "GO ontology",
+              choices = c(
+                "Biological process" = "BP",
+                "Molecular function" = "MF",
+                "Cellular component" = "CC"
+              ),
+              selected = "BP"
+            ),
+            textInput("disc_go_keyword", "Search GO term", "negative regulation of immune response"),
+            numericInput("disc_go_min_genes", "Minimum signature genes in dataset", 5, min = 2, max = 500, step = 1),
+            actionButton("disc_search_go", "Search GO terms", class = "btn btn-outline-primary w-100"),
+            selectInput("disc_go_term", "Selected GO term", choices = character(0))
+          ),
+          
+          conditionalPanel(
+            condition = "input.disc_signature_mode == 'custom'",
+            textAreaInput(
+              "disc_custom_genes",
+              "Custom signature genes",
+              value = "FOXP3\nIL2RA\nCTLA4\nTNFRSF18\nENTPD1\nLAG3",
+              rows = 8,
+              placeholder = "Paste gene symbols separated by spaces, commas, semicolons or new lines."
+            )
+          ),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Cell population"),
+          
+          selectInput(
+            "disc_subtype",
+            "Cancer subtype",
+            choices = de_subtype_choices,
+            selected = "ALL"
+          ),
+          
+          selectInput(
+            "disc_scope",
+            "Cells to analyze",
+            choices = c(
+              "All cells in subtype" = "all",
+              "Selected major cell type" = "major",
+              "Selected minor annotation" = "minor_annotation"
+            ),
+            selected = "major"
+          ),
+          
+          conditionalPanel(
+            condition = "input.disc_scope == 'major' || input.disc_scope == 'minor_annotation'",
+            uiOutput("disc_major_ui")
+          ),
+          
+          conditionalPanel(
+            condition = "input.disc_scope == 'minor_annotation'",
+            selectInput(
+              "disc_minor_groupby",
+              "Minor annotation column",
+              choices = minor_group_choices,
+              selected = if ("celltype_minor" %in% minor_group_choices) {
+                "celltype_minor"
+              } else {
+                minor_group_choices[1]
+              }
+            ),
+            uiOutput("disc_minor_level_ui")
+          ),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Analysis settings"),
+          numericInput("disc_min_cells", "Minimum cells", 30, min = 5, max = 10000, step = 5),
+          numericInput("disc_min_pct", "Minimum gene detection fraction", 0.05, min = 0, max = 1, step = 0.01),
+          numericInput("disc_max_cells", "Max cells for correlation", 10000, min = 0, max = 100000, step = 1000),
+          checkboxInput("disc_exclude_signature", "Exclude signature genes from ranked results", value = TRUE),
+          numericInput("disc_top_n", "Default genes per direction", 10, min = 1, max = 50, step = 1),
+          actionButton("disc_run", "Run discovery", class = "btn btn-primary w-100"),
+          
+          hr(),
+          
+          div(class = "sidebar-section-title", "Plot and export"),
+          numericInput("disc_base_size", "Text size", 11, min = 6, max = 24, step = 1),
+          numericInput("disc_gene_text_size", "Gene label font size", 11, min = 5, max = 24, step = 1),
+          numericInput("disc_plot_height_px", "Plot display height, px", 520, min = 260, max = 1200, step = 20),
+          numericInput("disc_pdf_w", "PDF width, in", 5.8, min = 2, max = 16, step = 0.2),
+          numericInput("disc_pdf_h", "PDF height, in", 5.2, min = 2, max = 16, step = 0.2),
+          textInput("disc_filebase", "File basename", "Discovery_signature_association"),
+          downloadButton("disc_dl_csv", "Download CSV", class = "btn btn-sm btn-primary w-100")
+        ),
+        
+        conditionalPanel(
           condition = "input.sc_tabs == 'de_tab'",
           
           div(class = "sidebar-section-title", "Gene+ versus Gene-"),
@@ -1082,7 +1501,7 @@ ui <- navbarPage(
           selectInput(
             "de_subtype",
             "Cancer subtype",
-            choices = subtypes_all,
+            choices = de_subtype_choices,
             selected = subtypes_all[1]
           ),
           
@@ -1151,6 +1570,14 @@ ui <- navbarPage(
           numericInput("de_go_q_cut", "GO q-value cutoff", 0.20, min = 0, max = 1, step = 0.01),
           numericInput("de_go_min_genes", "Minimum genes per direction", 5, min = 3, max = 100, step = 1),
           numericInput("de_go_top_n", "Terms shown in dotplot", 10, min = 1, max = 50, step = 1),
+          
+          tags$div(class = "small-muted", "GO dotplot layout"),
+          numericInput("de_go_plot_height_px", "Display height, px", 520, min = 220, max = 1200, step = 20),
+          numericInput("de_go_term_text_size", "GO term font size", 10, min = 5, max = 24, step = 1),
+          numericInput("de_go_label_wrap", "GO term wrap width", 36, min = 15, max = 80, step = 1),
+          numericInput("de_go_panel_spacing", "Vertical facet spacing, cm", 0.25, min = 0, max = 2, step = 0.05),
+          numericInput("de_go_pdf_w", "GO PDF width, in", 5.4, min = 2, max = 16, step = 0.2),
+          numericInput("de_go_pdf_h", "GO PDF height, in", 3.6, min = 1.5, max = 16, step = 0.2),
           
           hr(),
           
@@ -1290,6 +1717,48 @@ ui <- navbarPage(
             ),
             
             tabPanel(
+              title = "Discovery",
+              value = "discovery_tab",
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header("Discovery module summary"),
+                card_body(
+                  fluidRow(
+                    column(width = 5, div(class = "de-info-box", verbatimTextOutput("disc_summary"))),
+                    column(width = 7, div(class = "de-info-box", DTOutput("disc_signature_table")))
+                  )
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header(
+                  div(
+                    class = "plot-card-header",
+                    span(class = "plot-card-title", "Selected genes associated with the signature"),
+                    downloadButton("disc_dl_plot", "PDF", class = "btn-sm download-right")
+                  )
+                ),
+                card_body(
+                  uiOutput("disc_plot_ui")
+                )
+              ),
+              
+              card(
+                class = "plot-card de-section-card shadow-sm rounded-3 border-0",
+                card_header("Association results table"),
+                card_body(
+                  tags$div(
+                    class = "small-muted mb-2",
+                    "Select or deselect genes in this table to control the plot above. By default, the top positive and negative associated genes are selected."
+                  ),
+                  div(class = "de-table-box discovery-table-box", DTOutput("disc_table", width = "100%"))
+                )
+              )
+            ),
+            
+            tabPanel(
               title = "Gene DE",
               value = "de_tab",
               
@@ -1370,7 +1839,7 @@ ui <- navbarPage(
                   )
                 ),
                 card_body(
-                  div(class = "resizable-plot-box de-go-dotplot-box", plotOutput("de_go_dotplot", width = "100%", height = "100%"))
+                  uiOutput("de_go_dotplot_ui")
                 )
               ),
               
@@ -1393,6 +1862,7 @@ ui <- navbarPage(
       )
     )
   ),
+  
   
   tabPanel(
     title = "T47-D ChIP viewer",
@@ -1469,7 +1939,7 @@ ui <- navbarPage(
 server <- function(input, output, session) {
   
   observeEvent(input$go_viewer, {
-    updateNavbarPage(session, "mainnav", selected = "Single-cell viewer")
+    updateNavbarPage(session, "mainnav", selected = "Single-cell analyser")
   })
   
   observeEvent(input$go_chip, {
@@ -1488,14 +1958,347 @@ server <- function(input, output, session) {
   # ============================================================
   
   subtype_cells <- function(subtype) {
-    colnames(seurat_obj)[as.character(seurat_obj$subtype) == as.character(subtype)]
+    subtype <- as.character(subtype)
+    
+    if (length(subtype) == 0 || is.na(subtype)) {
+      return(character(0))
+    }
+    
+    if (identical(subtype, "ALL")) {
+      return(colnames(seurat_obj))
+    }
+    
+    colnames(seurat_obj)[as.character(seurat_obj$subtype) == subtype]
   }
   
   major_choices_for_subtype <- function(subtype) {
     cells <- subtype_cells(subtype)
+    
+    if (length(cells) == 0) {
+      return(character(0))
+    }
+    
     out <- sort(unique(as.character(seurat_obj$celltype_major[cells])))
     out[!is.na(out)]
   }
+  
+  # ============================================================
+  # Discovery module
+  # ============================================================
+  
+  disc_go_annotation_cache <- reactiveVal(NULL)
+  
+  get_disc_go_annotation <- function() {
+    cached <- disc_go_annotation_cache()
+    if (!is.null(cached)) {
+      return(cached)
+    }
+    
+    ann <- withProgress(message = "Loading GO annotations", value = 0, {
+      incProgress(0.2)
+      out <- get_go_annotation_for_genes(genes_all)
+      incProgress(0.8)
+      out
+    })
+    
+    disc_go_annotation_cache(ann)
+    ann
+  }
+  
+  output$disc_major_ui <- renderUI({
+    req(input$disc_subtype)
+    choices <- major_choices_for_subtype(input$disc_subtype)
+    validate(need(length(choices) > 0, "No major cell type available for the selected subtype."))
+    selectInput("disc_major", "Major cell type", choices = choices, selected = choices[1])
+  })
+  
+  disc_base_obj <- reactive({
+    req(input$disc_subtype)
+    cells <- subtype_cells(input$disc_subtype)
+    validate(need(length(cells) > 0, "No cells available for the selected subtype."))
+    subset(seurat_obj, cells = cells)
+  })
+  
+  disc_major_obj <- reactive({
+    req(input$disc_subtype, input$disc_major)
+    obj <- disc_base_obj()
+    cells <- colnames(obj)[as.character(obj$celltype_major) == as.character(input$disc_major)]
+    validate(need(length(cells) > 0, "No cells available for the selected major cell type."))
+    subset(obj, cells = cells)
+  })
+  
+  output$disc_minor_level_ui <- renderUI({
+    req(input$disc_scope, input$disc_major, input$disc_minor_groupby)
+    
+    if (!identical(input$disc_scope, "minor_annotation")) {
+      return(NULL)
+    }
+    
+    obj <- disc_major_obj()
+    validate(need(input$disc_minor_groupby %in% colnames(obj@meta.data), "Minor annotation not found."))
+    
+    levels_use <- sort(unique(as.character(obj@meta.data[[input$disc_minor_groupby]])))
+    levels_use <- levels_use[!is.na(levels_use)]
+    selectInput("disc_minor_level", "Minor population", choices = levels_use, selected = levels_use[1])
+  })
+  
+  disc_obj <- reactive({
+    if (identical(input$disc_scope, "all")) {
+      obj <- disc_base_obj()
+    } else if (identical(input$disc_scope, "major")) {
+      obj <- disc_major_obj()
+    } else {
+      req(input$disc_minor_groupby, input$disc_minor_level)
+      obj <- disc_major_obj()
+      cells <- colnames(obj)[
+        as.character(obj@meta.data[[input$disc_minor_groupby]]) == as.character(input$disc_minor_level)
+      ]
+      validate(need(length(cells) > 0, "No cells available for the selected minor population."))
+      obj <- subset(obj, cells = cells)
+    }
+    obj
+  })
+  
+  observeEvent(input$disc_search_go, {
+    ann <- get_disc_go_annotation()
+    keyword <- trimws(as.character(input$disc_go_keyword %||% ""))
+    ont <- as.character(input$disc_go_ont %||% "BP")
+    min_genes <- as.integer(input$disc_go_min_genes %||% 5)
+    
+    term_df <- ann %>%
+      dplyr::filter(ONTOLOGY == ont) %>%
+      dplyr::group_by(GO, TERM, ONTOLOGY) %>%
+      dplyr::summarise(n_genes = dplyr::n_distinct(SYMBOL), .groups = "drop") %>%
+      dplyr::filter(n_genes >= min_genes)
+    
+    if (nzchar(keyword)) {
+      term_df <- term_df %>%
+        dplyr::filter(grepl(keyword, TERM, ignore.case = TRUE) | grepl(keyword, GO, ignore.case = TRUE))
+    }
+    
+    term_df <- term_df %>%
+      dplyr::arrange(dplyr::desc(n_genes), TERM) %>%
+      dplyr::slice_head(n = 500)
+    
+    if (nrow(term_df) == 0) {
+      showNotification("No matching GO term found. Try a broader keyword or a lower minimum gene number.", type = "warning")
+      updateSelectInput(session, "disc_go_term", choices = character(0))
+    } else {
+      labels <- paste0(term_df$GO, " | ", term_df$TERM, " (", term_df$n_genes, " genes)")
+      updateSelectInput(
+        session,
+        "disc_go_term",
+        choices = stats::setNames(term_df$GO, labels),
+        selected = term_df$GO[1]
+      )
+    }
+  }, ignoreInit = TRUE)
+  
+  disc_signature_genes <- reactive({
+    if (identical(input$disc_signature_mode, "go")) {
+      req(input$disc_go_term)
+      ann <- get_disc_go_annotation()
+      raw_genes <- ann %>%
+        dplyr::filter(GO == input$disc_go_term) %>%
+        dplyr::pull(SYMBOL) %>%
+        unique()
+    } else {
+      raw_genes <- parse_signature_genes(input$disc_custom_genes)
+    }
+    
+    match_gene_symbols(raw_genes, rownames(seurat_obj))
+  })
+  
+  output$disc_signature_table <- renderDT({
+    genes <- disc_signature_genes()
+    df <- tibble::tibble(signature_gene_present = genes)
+    DT::datatable(
+      df,
+      rownames = FALSE,
+      class = "compact stripe hover row-border",
+      options = list(pageLength = 8, lengthMenu = c(8, 15, 30, 100), scrollY = "230px", scrollCollapse = TRUE)
+    )
+  })
+  
+  disc_result <- eventReactive(input$disc_run, {
+    obj <- disc_obj()
+    sig <- disc_signature_genes()
+    
+    validate(
+      need(length(sig) >= 2, "At least two signature genes must be present in the dataset."),
+      need(ncol(obj) >= input$disc_min_cells, paste0("Too few cells in selected population: ", ncol(obj)))
+    )
+    
+    withProgress(message = "Running signature association", value = 0, {
+      incProgress(0.25)
+      out <- run_signature_gene_association(
+        obj = obj,
+        signature_genes = sig,
+        min_pct = input$disc_min_pct,
+        exclude_signature = input$disc_exclude_signature,
+        max_cells = input$disc_max_cells,
+        random_seed = 1
+      )
+      incProgress(0.75)
+      
+      attr(out, "subtype") <- input$disc_subtype
+      attr(out, "scope") <- input$disc_scope
+      attr(out, "major") <- input$disc_major %||% NA
+      attr(out, "minor_groupby") <- input$disc_minor_groupby %||% NA
+      attr(out, "minor_level") <- input$disc_minor_level %||% NA
+      attr(out, "signature_mode") <- input$disc_signature_mode
+      attr(out, "go_term") <- input$disc_go_term %||% NA
+      attr(out, "go_keyword") <- input$disc_go_keyword %||% NA
+      attr(out, "custom_signature") <- input$disc_custom_genes %||% NA
+      out
+    })
+  }, ignoreInit = TRUE)
+  
+  output$disc_summary <- renderPrint({
+    sig <- disc_signature_genes()
+    obj <- disc_obj()
+    
+    cat("Signature mode:", input$disc_signature_mode, "\n")
+    if (identical(input$disc_signature_mode, "go")) {
+      ann <- get_disc_go_annotation()
+      term <- ann %>% dplyr::filter(GO == input$disc_go_term) %>% dplyr::slice_head(n = 1)
+      cat("GO term:", input$disc_go_term %||% NA, "\n")
+      if (nrow(term) > 0) cat("Description:", term$TERM[1], "\n")
+    }
+    cat("Signature genes present:", length(sig), "\n")
+    if (identical(as.character(input$disc_subtype), "ALL")) {
+      cat("Subtype: ALL\n")
+    } else {
+      cat("Subtype:", input$disc_subtype, "\n")
+    }
+    if (identical(input$disc_scope, "all")) cat("Population: all cells\n")
+    if (identical(input$disc_scope, "major")) cat("Population:", input$disc_major, "\n")
+    if (identical(input$disc_scope, "minor_annotation")) {
+      cat("Major:", input$disc_major, "\n")
+      cat("Minor:", input$disc_minor_level, "\n")
+      cat("Annotation:", input$disc_minor_groupby, "\n")
+    }
+    cat("Cells available:", ncol(obj), "\n")
+    
+    if (!is.null(disc_result())) {
+      res <- disc_result()
+      cat("Cells used:", attr(res, "n_cells"), "\n")
+      cat("Genes tested:", attr(res, "n_genes_tested"), "\n")
+      cat("Signature score mean:", signif(attr(res, "score_mean"), 4), "\n")
+      cat("Signature score SD:", signif(attr(res, "score_sd"), 4), "\n")
+    }
+  })
+  
+  disc_table_data <- reactive({
+    res <- disc_result()
+    res %>%
+      dplyr::mutate(
+        direction = as.character(direction),
+        abs_correlation = abs(correlation)
+      ) %>%
+      dplyr::arrange(
+        dplyr::case_when(
+          direction == "Negative association" ~ 1L,
+          direction == "Positive association" ~ 2L,
+          TRUE ~ 3L
+        ),
+        dplyr::desc(abs_correlation),
+        p.adjust
+      )
+  })
+  
+  disc_default_rows <- reactive({
+    df <- disc_table_data()
+    top_n <- max(1, as.integer(input$disc_top_n %||% 10))
+    neg_idx <- which(!is.na(df$correlation) & df$correlation < 0)
+    pos_idx <- which(!is.na(df$correlation) & df$correlation > 0)
+    
+    if (length(neg_idx) > 0) {
+      neg_idx <- neg_idx[order(df$correlation[neg_idx], df$p.adjust[neg_idx])]
+      neg_idx <- head(neg_idx, top_n)
+    }
+    
+    if (length(pos_idx) > 0) {
+      pos_idx <- pos_idx[order(-df$correlation[pos_idx], df$p.adjust[pos_idx])]
+      pos_idx <- head(pos_idx, top_n)
+    }
+    
+    unique(c(neg_idx, pos_idx))
+  })
+  
+  disc_selected_data <- reactive({
+    df <- disc_table_data()
+    sel <- input$disc_table_rows_selected
+    
+    if (is.null(sel) || length(sel) == 0) {
+      sel <- disc_default_rows()
+    }
+    
+    sel <- sel[sel >= 1 & sel <= nrow(df)]
+    validate(need(length(sel) > 0, "Select at least one gene in the association table."))
+    df[sel, , drop = FALSE]
+  })
+  
+  disc_plot <- reactive({
+    res <- disc_result()
+    title <- "Signature-associated genes"
+    if (identical(attr(res, "signature_mode"), "go") && !is.na(attr(res, "go_term"))) {
+      title <- paste0("Genes associated with ", attr(res, "go_term"))
+    }
+    make_discovery_association_plot(
+      disc_selected_data(),
+      top_n = NULL,
+      base_size = input$disc_base_size,
+      gene_text_size = input$disc_gene_text_size,
+      title = title
+    )
+  })
+  
+  output$disc_plot_ui <- renderUI({
+    h <- as.numeric(input$disc_plot_height_px %||% 520)
+    h <- min(max(h, 260), 1200)
+    div(
+      class = "resizable-plot-box discovery-plot-box",
+      style = paste0("height:", h, "px; min-height:260px;"),
+      plotOutput("disc_plot", width = "100%", height = "100%")
+    )
+  })
+  
+  output$disc_plot <- renderPlot(disc_plot())
+  
+  output$disc_table <- renderDT({
+    df <- disc_table_data()
+    show_df <- df %>%
+      dplyr::select(gene, direction, correlation, p.value, p.adjust, association_score, avg_expr, pct_expr)
+    
+    DT::datatable(
+      show_df,
+      rownames = FALSE,
+      filter = "top",
+      selection = list(mode = "multiple", selected = disc_default_rows()),
+      class = "compact stripe hover row-border nowrap",
+      options = list(
+        pageLength = 20,
+        lengthMenu = c(10, 20, 50, 100),
+        scrollX = TRUE,
+        scrollY = "390px",
+        scrollCollapse = TRUE,
+        order = list(list(3, "desc")),
+        dom = "lfrtip"
+      )
+    ) %>%
+      DT::formatSignif(columns = c("correlation", "p.value", "p.adjust", "association_score", "avg_expr", "pct_expr"), digits = 3)
+  })
+  
+  output$disc_dl_csv <- downloadHandler(
+    filename = function() paste0(input$disc_filebase, "_", input$disc_subtype, ".csv"),
+    content = function(file) readr::write_csv(disc_result(), file)
+  )
+  
+  output$disc_dl_plot <- downloadHandler(
+    filename = function() paste0(input$disc_filebase, "_plot_", input$disc_subtype, ".pdf"),
+    content = function(file) save_pdf(disc_plot(), file, input$disc_pdf_w, input$disc_pdf_h)
+  )
   
   output$minor_major_ui <- renderUI({
     req(input$minor_subtype)
@@ -1506,6 +2309,9 @@ server <- function(input, output, session) {
   output$de_major_ui <- renderUI({
     req(input$de_subtype)
     choices <- major_choices_for_subtype(input$de_subtype)
+    
+    validate(need(length(choices) > 0, "No major cell type available for the selected subtype."))
+    
     selectInput("de_major", "Major cell type", choices = choices, selected = choices[1])
   })
   
@@ -1782,7 +2588,9 @@ server <- function(input, output, session) {
   de_base_obj <- reactive({
     req(input$de_subtype)
     cells <- subtype_cells(input$de_subtype)
+    
     validate(need(length(cells) > 0, "No cells available for the selected subtype."))
+    
     subset(seurat_obj, cells = cells)
   })
   
@@ -1838,14 +2646,34 @@ server <- function(input, output, session) {
     
     x <- FetchData(obj, vars = input$de_gene)[, 1]
     
-    data.frame(
+    gene_group <- factor(
+      ifelse(x > input$de_thresh, "Gene+", "Gene-"),
+      levels = c("Gene-", "Gene+")
+    )
+    
+    out <- data.frame(
       group = c("Gene-", "Gene+"),
       definition = c(
         paste0(input$de_gene, " <= ", input$de_thresh),
         paste0(input$de_gene, " > ", input$de_thresh)
       ),
-      cells = c(sum(x <= input$de_thresh), sum(x > input$de_thresh))
+      cells = c(sum(gene_group == "Gene-"), sum(gene_group == "Gene+")),
+      stringsAsFactors = FALSE
     )
+    
+    if ("subtype" %in% colnames(obj@meta.data)) {
+      subtype_vec <- as.character(obj@meta.data[colnames(obj), "subtype"])
+      subtype_tab <- as.data.frame.matrix(table(gene_group, subtype_vec))
+      subtype_tab$group <- rownames(subtype_tab)
+      rownames(subtype_tab) <- NULL
+      
+      out <- dplyr::left_join(out, subtype_tab, by = "group")
+      
+      subtype_cols <- setdiff(colnames(out), c("group", "definition", "cells"))
+      out[subtype_cols][is.na(out[subtype_cols])] <- 0
+    }
+    
+    out
   })
   
   output$de_group_table <- renderTable(de_group_counts())
@@ -1911,7 +2739,11 @@ server <- function(input, output, session) {
     res <- de_result()
     
     cat("Gene:", attr(res, "gene"), "\n")
-    cat("Subtype:", attr(res, "subtype"), "\n")
+    if (identical(as.character(attr(res, "subtype")), "ALL")) {
+      cat("Subtype: ALL (", paste(subtypes_all, collapse = " + "), ")\n", sep = "")
+    } else {
+      cat("Subtype:", attr(res, "subtype"), "\n")
+    }
     
     if (attr(res, "scope") == "all") {
       cat("Population: all cells\n")
@@ -2155,6 +2987,16 @@ server <- function(input, output, session) {
       DT::formatSignif(columns = c("pvalue", "p.adjust", "qvalue"), digits = 3)
   })
   
+  output$de_go_dotplot_ui <- renderUI({
+    h <- as.numeric(input$de_go_plot_height_px %||% 520)
+    h <- min(max(h, 220), 1200)
+    div(
+      class = "resizable-plot-box de-go-dotplot-box",
+      style = paste0("height:", h, "px; min-height:220px;"),
+      plotOutput("de_go_dotplot", width = "100%", height = "100%")
+    )
+  })
+  
   de_go_dotplot_plot <- reactive({
     go_sel <- de_go_selected_data()
     
@@ -2162,7 +3004,11 @@ server <- function(input, output, session) {
       go_df = go_sel,
       top_n = input$de_go_top_n,
       base_size = input$de_base_size,
-      title = NULL
+      title = NULL,
+      term_text_size = input$de_go_term_text_size,
+      wrap_width = input$de_go_label_wrap,
+      panel_spacing_y = input$de_go_panel_spacing,
+      tile_height = 0.55
     )
   })
   
@@ -2175,7 +3021,7 @@ server <- function(input, output, session) {
   
   output$de_dl_go_dotplot <- downloadHandler(
     filename = function() paste0(input$de_filebase, "_GO_Dotplot_", input$de_go_ont, "_", input$de_subtype, "_", input$de_gene, ".pdf"),
-    content = function(file) save_pdf(de_go_dotplot_plot(), file, input$de_pdf_w, input$de_pdf_h)
+    content = function(file) save_pdf(de_go_dotplot_plot(), file, input$de_go_pdf_w, input$de_go_pdf_h)
   )
   
   # ------------------------------------------------------------
